@@ -8,32 +8,65 @@ pip install -r requirements.txt pyinstaller
 
 Write-Host "==> [2/5] Downloading and bundling FFmpeg"
 New-Item -ItemType Directory -Force -Path bin | Out-Null
+# Use FULL builds: the "essentials" variant lacks libsvtav1 / libaom-av1 / libvpx etc.
 $urls = @(
-  "https://www.gyan.dev/ffmpeg/builds/ffmpeg-release-essentials.zip",
-  "https://github.com/GyanD/codexffmpeg/releases/download/7.1/ffmpeg-7.1-essentials_build.zip",
-  "https://github.com/BtbN/FFmpeg-Builds/releases/download/latest/ffmpeg-master-latest-win64-gpl.zip"
+  "https://www.gyan.dev/ffmpeg/builds/ffmpeg-release-full.7z",
+  "https://github.com/GyanD/codexffmpeg/releases/download/7.1/ffmpeg-7.1-full_build.7z",
+  "https://github.com/BtbN/FFmpeg-Builds/releases/download/latest/ffmpeg-master-latest-win64-gpl.zip",
+  "https://www.gyan.dev/ffmpeg/builds/ffmpeg-release-essentials.zip"
 )
-$ok = $false
+$archive = $null
 foreach ($url in $urls) {
+  $ext = if ($url -match '\.7z$') { "7z" } else { "zip" }
+  $dest = "ffmpeg_dl.$ext"
   try {
     Write-Host "    trying: $url"
-    Invoke-WebRequest -Uri $url -OutFile ffmpeg.zip -TimeoutSec 300
-    $ok = $true
+    Invoke-WebRequest -Uri $url -OutFile $dest -TimeoutSec 600
+    $archive = $dest
     break
   } catch {
     Write-Warning "    source failed: $($_.Exception.Message)"
+    if (Test-Path $dest) { Remove-Item $dest -Force }
   }
 }
-if (-not $ok) { throw "All FFmpeg download sources failed" }
+if (-not $archive) { throw "All FFmpeg download sources failed" }
 
-Expand-Archive ffmpeg.zip -DestinationPath ffmpeg_tmp -Force
+Write-Host "    extracting $archive"
+if ($archive -match '\.7z$') {
+  # 7-Zip is preinstalled on GitHub windows runners; fall back to choco if missing.
+  $sevenzip = "$env:ProgramFiles\7-Zip\7z.exe"
+  if (-not (Test-Path $sevenzip)) { $sevenzip = (Get-Command 7z -ErrorAction SilentlyContinue).Source }
+  if (-not $sevenzip) {
+    choco install 7zip -y --no-progress
+    $sevenzip = "$env:ProgramFiles\7-Zip\7z.exe"
+  }
+  if (-not (Test-Path $sevenzip)) { throw "7z.exe not found, cannot extract .7z archive" }
+  & $sevenzip x $archive "-offmpeg_tmp" -y | Out-Null
+  if ($LASTEXITCODE -ne 0) { throw "7z extraction failed" }
+} else {
+  Expand-Archive $archive -DestinationPath ffmpeg_tmp -Force
+}
 $ff = Get-ChildItem ffmpeg_tmp -Recurse -Filter ffmpeg.exe  | Select-Object -First 1
 $fp = Get-ChildItem ffmpeg_tmp -Recurse -Filter ffprobe.exe | Select-Object -First 1
 if (-not $ff) { throw "ffmpeg.exe not found in archive" }
 Copy-Item $ff.FullName bin\ -Force
 if ($fp) { Copy-Item $fp.FullName bin\ -Force }
-Remove-Item ffmpeg.zip, ffmpeg_tmp -Recurse -Force
+Remove-Item $archive, ffmpeg_tmp -Recurse -Force
 Get-ChildItem bin
+
+# Verify the encoders the UI offers are actually present in this FFmpeg build.
+Write-Host "    verifying bundled encoders"
+$encoders = & bin\ffmpeg.exe -hide_banner -encoders 2>&1 | Out-String
+$want = @("libx264","libx265","libsvtav1","libvpx-vp9","libmp3lame","libopus","libvorbis","aac","flac")
+$missing = @()
+foreach ($e in $want) {
+  if ($encoders -notmatch [regex]::Escape($e)) { $missing += $e }
+}
+if ($missing.Count -gt 0) {
+  Write-Warning "    bundled FFmpeg is missing: $($missing -join ', ')"
+} else {
+  Write-Host "    all key encoders present"
+}
 
 Write-Host "==> [3/5] Running PyInstaller"
 # Sanity check: make sure we are building the fixed spec, not a stale checkout.

@@ -303,12 +303,25 @@ class MainWindow(QMainWindow):
         def fill(cb: QComboBox, codecs: tuple[str, ...], table: dict) -> None:
             cb.blockSignals(True)
             cb.clear()
+            first_usable = -1
             for c in codecs:
                 info = table.get(c)
                 label = info.label if info else c
-                if c != "copy" and avail and c not in avail:
+                usable = (c in ("copy", "none")) or (not avail) or (c in avail)
+                if not usable:
                     label += "（当前 FFmpeg 不支持）"
                 cb.addItem(label, c)
+                idx = cb.count() - 1
+                if not usable:
+                    # 真正禁用该项，避免用户选到跑不了的编码器
+                    item = cb.model().item(idx)
+                    if item is not None:
+                        item.setEnabled(False)
+                elif first_usable < 0:
+                    first_usable = idx
+            # 默认选中第一个「可用」的编码器，而不是列表里的第一项
+            if first_usable >= 0:
+                cb.setCurrentIndex(first_usable)
             cb.setEnabled(cb.count() > 0)
             cb.blockSignals(False)
 
@@ -546,6 +559,24 @@ class MainWindow(QMainWindow):
             return
 
         params = self.collect_params()
+
+        # 提前拦截当前 FFmpeg 不支持的编码器，给出可读提示
+        if kind != F.IMAGE:
+            avail = available_encoders()
+            if avail:
+                for key, table in (("video_codec", F.VIDEO_CODECS),
+                                   ("audio_codec", F.AUDIO_CODECS)):
+                    enc = params.get(key) or ""
+                    if enc and enc not in ("copy", "none") and enc not in avail:
+                        info = table.get(enc)
+                        QMessageBox.critical(
+                            self, "编码器不可用",
+                            f"当前 FFmpeg 不支持编码器 {info.label if info else enc}"
+                            f"（{enc}），无法转换。\n\n"
+                            "请在上方下拉框中改选其它编码器"
+                            "（灰色项表示不可用），或更换功能更完整的 FFmpeg。")
+                        return
+
         self.queue = ConversionQueue(workers=self.sp_workers.value())
         self.queue.on_progress = self.bridge.progress.emit
         self.queue.on_job_done = self.bridge.job_done.emit
