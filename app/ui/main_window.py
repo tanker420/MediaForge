@@ -349,20 +349,42 @@ class MainWindow(QMainWindow):
         idx = self.cb_format.findData(p.ext)
         if idx >= 0:
             self.cb_format.setCurrentIndex(idx)
-        vc = p.params.get("video_codec")
-        if vc:
-            i = self.cb_vcodec.findData(vc)
-            if i >= 0:
-                self.cb_vcodec.setCurrentIndex(i)
-        ac = p.params.get("audio_codec")
-        if ac:
-            i = self.cb_acodec.findData(ac)
-            if i >= 0:
-                self.cb_acodec.setCurrentIndex(i)
+        # 预设可能指定当前 FFmpeg 不支持的编码器（如精简版缺 libsvtav1），
+        # 此时自动回退到列表中第一个可用项，避免转换时才报错。
+        avail = available_encoders()
+        fallbacks: list[str] = []
+
+        def pick(cb: QComboBox, want: str, table: dict) -> None:
+            if not want:
+                return
+            i = cb.findData(want)
+            usable = (want in ("copy", "none")) or (not avail) or (want in avail)
+            if i >= 0 and usable:
+                cb.setCurrentIndex(i)
+                return
+            for j in range(cb.count()):
+                item = cb.model().item(j)
+                if item is not None and item.isEnabled():
+                    cb.setCurrentIndex(j)
+                    info = table.get(want)
+                    fallbacks.append(f"{info.label if info else want} → {cb.currentText()}")
+                    return
+
+        pick(self.cb_vcodec, p.params.get("video_codec", ""), F.VIDEO_CODECS)
+        pick(self.cb_acodec, p.params.get("audio_codec", ""), F.AUDIO_CODECS)
+
         for form in (self.form_vcodec, self.form_acodec, self.form_vfilter,
                      self.form_afilter, self.form_general, self.form_image):
             form.set_values(p.params)
-        self.status.showMessage(f"已应用预设：{p.name}", 4000)
+
+        if fallbacks:
+            self.status.showMessage(
+                f"已应用预设：{p.name}（当前 FFmpeg 不支持部分编码器，已自动替换："
+                + "；".join(fallbacks) + "）", 12000)
+            self.log.append(f"[提示] 预设「{p.name}」中的编码器不可用，已自动替换："
+                            + "；".join(fallbacks))
+        else:
+            self.status.showMessage(f"已应用预设：{p.name}", 4000)
 
     # ------------------------------------------------------------------
     # 参数收集

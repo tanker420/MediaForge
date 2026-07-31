@@ -117,3 +117,50 @@ def test_no_crash_when_encoder_list_unknown(qapp, monkeypatch):
     w.cb_format.setCurrentIndex(w.cb_format.findData("mkv"))
     assert all(en for _, en in _codec_items(w.cb_vcodec)), \
         "编码器列表未知时不应禁用任何选项"
+
+
+def test_preset_falls_back_to_available_encoder(win):
+    """预设指定的编码器不可用时，应自动替换为可用项。
+
+    回归：选择《AV1 高压缩》预设后，界面照单全收设成 libsvtav1，
+    而精简版 FFmpeg 并无该编码器，转换时才抛出 Unknown encoder。
+    """
+    i = win.cb_preset.findData("AV1 高压缩")
+    if i < 0:
+        pytest.skip("未找到 AV1 预设")
+    win.cb_preset.setCurrentIndex(i)
+
+    sel = win.cb_vcodec.currentData()
+    assert sel != "libsvtav1"
+    assert sel in LIMITED, f"回退后仍不可用：{sel}"
+    assert win.collect_params()["video_codec"] in LIMITED
+
+
+def test_preset_notifies_user_about_substitution(win):
+    i = win.cb_preset.findData("AV1 高压缩")
+    if i < 0:
+        pytest.skip("未找到 AV1 预设")
+    win.cb_preset.setCurrentIndex(i)
+    assert "自动替换" in win.status.currentMessage()
+
+
+def test_all_builtin_presets_yield_usable_encoder(win):
+    """任何内置预设应用后，都不该留下不可用的编码器。"""
+    from app.core import presets as P
+
+    for p in P.BUILTIN:
+        if p.kind == F.IMAGE:
+            continue
+        idx = win.cb_kind.findData(p.kind)
+        if idx >= 0:
+            win.cb_kind.setCurrentIndex(idx)
+        j = win.cb_preset.findData(p.name)
+        if j < 0:
+            continue
+        win.cb_preset.setCurrentIndex(j)
+        params = win.collect_params()
+        for key in ("video_codec", "audio_codec"):
+            enc = params.get(key) or ""
+            if not enc or enc in ("copy", "none"):
+                continue
+            assert enc in LIMITED, f"预设《{p.name}》产生了不可用的 {key}={enc}"
