@@ -1,9 +1,12 @@
-name: 构建 Windows 安装程序
+name: 构建 Windows 安装程序与发布
 
 on:
   workflow_dispatch:
   push:
     tags: ["v*"]
+
+permissions:
+  contents: write
 
 jobs:
   build:
@@ -18,3 +21,9 @@ jobs:
         with:
           name: MediaForge-Windows-Setup
           path: dist_installer/*
+      - name: 发布 GitHub Release
+        uses: softprops/action-gh-release@v2
+        if: startsWith(github.ref, 'refs/tags/v')
+        with:
+          files: dist_installer/*
+          generate_release_notes: true
