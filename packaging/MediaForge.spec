@@ -10,7 +10,13 @@ from pathlib import Path
 ROOT = Path(os.getcwd())
 RES = ROOT / "app" / "resources"
 ICON = RES / "icon.ico"
-VERSION_FILE = ROOT / "packaging" / "version_info.txt"
+VERSION_FILE = (Path(SPECPATH) / "version_info.txt").resolve() \
+    if "SPECPATH" in globals() else (ROOT / "packaging" / "version_info.txt").resolve()
+
+# 只有在 Windows 且文件确实存在时才写入版本资源；始终使用绝对路径。
+VERSION_ARG = str(VERSION_FILE) if (os.name == "nt" and VERSION_FILE.is_file()) else None
+print(f"[spec] ROOT={ROOT}")
+print(f"[spec] VERSION_ARG={VERSION_ARG}")
 
 datas = [(str(RES), "app/resources")]
 
@@ -62,9 +68,9 @@ exe = EXE(
     console=False,          # GUI 程序，不弹黑框
     disable_windowed_traceback=False,
     icon=str(ICON) if ICON.exists() else None,
-    # 必须用绝对路径：PyInstaller 解析此项时以 spec 所在目录为基准，
-    # 写相对路径会被拼成 packaging/packaging/version_info.txt
-    version=str(VERSION_FILE) if (os.name == "nt" and VERSION_FILE.exists()) else None,
+    # 必须传绝对路径：PyInstaller 解析此项时以 spec 所在目录为基准，
+    # 传相对路径会被拼成 packaging/packaging/version_info.txt 从而报错。
+    version=VERSION_ARG,
 )
 
 coll = COLLECT(

@@ -36,6 +36,13 @@ Remove-Item ffmpeg.zip, ffmpeg_tmp -Recurse -Force
 Get-ChildItem bin
 
 Write-Host "==> [3/5] Running PyInstaller"
+# Sanity check: make sure we are building the fixed spec, not a stale checkout.
+$specText = Get-Content packaging\MediaForge.spec -Raw
+if ($specText -match 'version\s*=\s*"packaging/version_info.txt"') {
+  throw "Stale spec detected (relative version path). The checkout is not up to date - start a NEW workflow run instead of re-running the old one."
+}
+Write-Host "    spec check passed"
+
 pyinstaller packaging/MediaForge.spec --noconfirm --clean
 $exe = "dist\MediaForge\MediaForge.exe"
 if (-not (Test-Path $exe)) { throw "exe was not produced" }
