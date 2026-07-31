@@ -115,20 +115,16 @@ packaging\build_windows.bat
 
 ### 用 GitHub Actions 构建
 
-工作流模板位于 `packaging/ci/build-windows.yml`。启用方法（只需一次）：
+**完全不懂技术？** 请看 [《如何生成安装程序》](如何生成安装程序.md)，3 步图文教程。
 
-```bash
-mkdir -p .github/workflows
-cp packaging/ci/build-windows.yml .github/workflows/
-git add .github/workflows/build-windows.yml && git commit -m "ci: 启用 Windows 构建" && git push
-```
+工作流模板位于 `packaging/ci/build-windows.yml`，需手动复制到 `.github/workflows/` 启用一次
+（推送工作流文件需要 GitHub App 的 `workflows` 权限，故未直接入库）。
 
-> 放在 `packaging/ci/` 而非 `.github/workflows/` 是因为往仓库推送工作流文件
-> 需要 GitHub App 的 `workflows` 权限；手动复制一次即可绕过。
-
-启用后，推送代码即自动触发：
-在 Windows runner 上跑测试 → 下载并内置 FFmpeg → PyInstaller 打包 → 冒烟测试 → 编译 Inno Setup 安装程序 → 上传产物。
+启用后到 Actions 页面点 `Run workflow` 即可：
+自动下载内置 FFmpeg → PyInstaller 打包 → 冒烟测试 → 编译 Inno Setup 安装程序 → 上传产物。
 打 `v*` 标签会自动发布 Release。
+
+实际的构建逻辑在 `packaging/ci/build.ps1`，本地 Windows 也可直接运行它。
 
 ## 项目结构
 

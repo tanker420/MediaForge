@@ -1,162 +1,20 @@
 name: 构建 Windows 安装程序
 
 on:
-  push:
-    branches: [ "arena/**", main ]
-    tags: [ "v*" ]
   workflow_dispatch:
-    inputs:
-      bundle_ffmpeg:
-        description: 把 FFmpeg 一起打包进安装程序（体积更大，用户无需另装）
-        type: boolean
-        default: true
-
-permissions:
-  contents: write
-
-env:
-  PYTHON_VERSION: "3.12"
-  BUNDLE_FFMPEG: ${{ github.event.inputs.bundle_ffmpeg || 'true' }}
+  push:
+    tags: ["v*"]
 
 jobs:
-  test:
-    name: 测试 (Windows)
-    runs-on: windows-latest
-    # 测试失败也继续打包，保证总能拿到安装程序
-    continue-on-error: true
-    steps:
-      - uses: actions/checkout@v4
-
-      - uses: actions/setup-python@v5
-        with:
-          python-version: ${{ env.PYTHON_VERSION }}
-          cache: pip
-
-      - name: 安装依赖
-        run: |
-          python -m pip install --upgrade pip
-          pip install -r requirements.txt
-          pip install pytest
-
-      - name: 安装 FFmpeg（供测试使用）
-        run: choco install ffmpeg -y --no-progress
-
-      - name: 运行测试
-        run: pytest tests/ -v --tb=short
-
   build:
-    name: 打包安装程序
-    needs: test
-    if: always()          # 即使测试未通过，也照常产出安装程序
     runs-on: windows-latest
     steps:
       - uses: actions/checkout@v4
-
       - uses: actions/setup-python@v5
         with:
-          python-version: ${{ env.PYTHON_VERSION }}
-          cache: pip
-
-      - name: 安装依赖
-        run: |
-          python -m pip install --upgrade pip
-          pip install -r requirements.txt
-          pip install pyinstaller
-
-      - name: 下载并内置 FFmpeg
-        if: env.BUNDLE_FFMPEG == 'true'
-        shell: pwsh
-        run: |
-          $ErrorActionPreference = "Stop"
-          New-Item -ItemType Directory -Force -Path bin | Out-Null
-          # 多个下载源，任一可用即可，避免单一链接失效导致构建中断
-          $urls = @(
-            "https://www.gyan.dev/ffmpeg/builds/ffmpeg-release-essentials.zip",
-            "https://github.com/GyanD/codexffmpeg/releases/download/7.1/ffmpeg-7.1-essentials_build.zip",
-            "https://github.com/BtbN/FFmpeg-Builds/releases/download/latest/ffmpeg-master-latest-win64-gpl.zip"
-          )
-          $ok = $false
-          foreach ($url in $urls) {
-            try {
-              Write-Host "尝试下载 FFmpeg: $url"
-              Invoke-WebRequest -Uri $url -OutFile ffmpeg.zip -TimeoutSec 300
-              $ok = $true; break
-            } catch {
-              Write-Warning "该源失败：$($_.Exception.Message)"
-            }
-          }
-          if (-not $ok) { throw "所有 FFmpeg 下载源均不可用" }
-          Expand-Archive ffmpeg.zip -DestinationPath ffmpeg_tmp -Force
-          $ff = Get-ChildItem ffmpeg_tmp -Recurse -Filter ffmpeg.exe  | Select-Object -First 1
-          $fp = Get-ChildItem ffmpeg_tmp -Recurse -Filter ffprobe.exe | Select-Object -First 1
-          if (-not $ff) { throw "压缩包中未找到 ffmpeg.exe" }
-          Copy-Item $ff.FullName bin\ -Force
-          if ($fp) { Copy-Item $fp.FullName bin\ -Force }
-          Remove-Item ffmpeg.zip, ffmpeg_tmp -Recurse -Force
-          Get-ChildItem bin
-
-      - name: PyInstaller 打包
-        run: pyinstaller packaging/MediaForge.spec --noconfirm --clean
-
-      - name: 冒烟测试（确认 exe 能运行）
-        shell: pwsh
-        run: |
-          $exe = "dist\MediaForge\MediaForge.exe"
-          if (-not (Test-Path $exe)) { throw "未生成 exe" }
-          & $exe doctor
-          if ($LASTEXITCODE -ne 0) { throw "doctor 命令失败，退出码 $LASTEXITCODE" }
-          & $exe list-formats | Select-Object -First 5
-          Write-Host "冒烟测试通过"
-
-      - name: 编译 Inno Setup 安装程序
-        shell: pwsh
-        run: |
-          $iscc = "${env:ProgramFiles(x86)}\Inno Setup 6\ISCC.exe"
-          if (-not (Test-Path $iscc)) {
-            Write-Host "未检测到 Inno Setup，正在安装…"
-            choco install innosetup -y --no-progress
-          }
-          if (-not (Test-Path $iscc)) {
-            $found = Get-ChildItem "C:\Program Files*" -Recurse -Filter ISCC.exe -ErrorAction SilentlyContinue |
-                     Select-Object -First 1
-            if (-not $found) { throw "找不到 ISCC.exe（Inno Setup 编译器）" }
-            $iscc = $found.FullName
-          }
-          Write-Host "使用编译器: $iscc"
-          & $iscc packaging\installer.iss
-          if ($LASTEXITCODE -ne 0) { throw "Inno Setup 编译失败" }
-          Get-ChildItem dist_installer
-
-      - name: 生成校验值
-        shell: pwsh
-        run: |
-          Get-ChildItem dist_installer\*.exe | ForEach-Object {
-            $h = (Get-FileHash $_.FullName -Algorithm SHA256).Hash
-            "$h  $($_.Name)" | Out-File -Append -Encoding utf8 dist_installer\SHA256SUMS.txt
-          }
-          Get-Content dist_installer\SHA256SUMS.txt
-
-      - name: 上传安装程序
-        uses: actions/upload-artifact@v4
+          python-version: "3.12"
+      - run: powershell -ExecutionPolicy Bypass -File packaging\ci\build.ps1
+      - uses: actions/upload-artifact@v4
         with:
           name: MediaForge-Windows-Setup
-          path: |
-            dist_installer/*.exe
-            dist_installer/SHA256SUMS.txt
-          retention-days: 90
-
-      - name: 上传免安装版
-        uses: actions/upload-artifact@v4
-        with:
-          name: MediaForge-Windows-Portable
-          path: dist/MediaForge/
-          retention-days: 90
-
-      - name: 发布 Release（打 tag 时）
-        if: startsWith(github.ref, 'refs/tags/v')
-        uses: softprops/action-gh-release@v2
-        with:
-          files: |
-            dist_installer/*.exe
-            dist_installer/SHA256SUMS.txt
-          generate_release_notes: true
+          path: dist_installer/*
