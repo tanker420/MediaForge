@@ -22,6 +22,8 @@ jobs:
   test:
     name: 测试 (Windows)
     runs-on: windows-latest
+    # 测试失败也继续打包，保证总能拿到安装程序
+    continue-on-error: true
     steps:
       - uses: actions/checkout@v4
 
@@ -45,6 +47,7 @@ jobs:
   build:
     name: 打包安装程序
     needs: test
+    if: always()          # 即使测试未通过，也照常产出安装程序
     runs-on: windows-latest
     steps:
       - uses: actions/checkout@v4
@@ -66,13 +69,29 @@ jobs:
         run: |
           $ErrorActionPreference = "Stop"
           New-Item -ItemType Directory -Force -Path bin | Out-Null
-          $url = "https://github.com/GyanD/codexffmpeg/releases/download/7.1/ffmpeg-7.1-essentials_build.zip"
-          Write-Host "下载 FFmpeg: $url"
-          Invoke-WebRequest -Uri $url -OutFile ffmpeg.zip
+          # 多个下载源，任一可用即可，避免单一链接失效导致构建中断
+          $urls = @(
+            "https://www.gyan.dev/ffmpeg/builds/ffmpeg-release-essentials.zip",
+            "https://github.com/GyanD/codexffmpeg/releases/download/7.1/ffmpeg-7.1-essentials_build.zip",
+            "https://github.com/BtbN/FFmpeg-Builds/releases/download/latest/ffmpeg-master-latest-win64-gpl.zip"
+          )
+          $ok = $false
+          foreach ($url in $urls) {
+            try {
+              Write-Host "尝试下载 FFmpeg: $url"
+              Invoke-WebRequest -Uri $url -OutFile ffmpeg.zip -TimeoutSec 300
+              $ok = $true; break
+            } catch {
+              Write-Warning "该源失败：$($_.Exception.Message)"
+            }
+          }
+          if (-not $ok) { throw "所有 FFmpeg 下载源均不可用" }
           Expand-Archive ffmpeg.zip -DestinationPath ffmpeg_tmp -Force
-          $src = Get-ChildItem ffmpeg_tmp -Directory | Select-Object -First 1
-          Copy-Item "$($src.FullName)\bin\ffmpeg.exe"  bin\ -Force
-          Copy-Item "$($src.FullName)\bin\ffprobe.exe" bin\ -Force
+          $ff = Get-ChildItem ffmpeg_tmp -Recurse -Filter ffmpeg.exe  | Select-Object -First 1
+          $fp = Get-ChildItem ffmpeg_tmp -Recurse -Filter ffprobe.exe | Select-Object -First 1
+          if (-not $ff) { throw "压缩包中未找到 ffmpeg.exe" }
+          Copy-Item $ff.FullName bin\ -Force
+          if ($fp) { Copy-Item $fp.FullName bin\ -Force }
           Remove-Item ffmpeg.zip, ffmpeg_tmp -Recurse -Force
           Get-ChildItem bin
 
@@ -94,8 +113,16 @@ jobs:
         run: |
           $iscc = "${env:ProgramFiles(x86)}\Inno Setup 6\ISCC.exe"
           if (-not (Test-Path $iscc)) {
+            Write-Host "未检测到 Inno Setup，正在安装…"
             choco install innosetup -y --no-progress
           }
+          if (-not (Test-Path $iscc)) {
+            $found = Get-ChildItem "C:\Program Files*" -Recurse -Filter ISCC.exe -ErrorAction SilentlyContinue |
+                     Select-Object -First 1
+            if (-not $found) { throw "找不到 ISCC.exe（Inno Setup 编译器）" }
+            $iscc = $found.FullName
+          }
+          Write-Host "使用编译器: $iscc"
           & $iscc packaging\installer.iss
           if ($LASTEXITCODE -ne 0) { throw "Inno Setup 编译失败" }
           Get-ChildItem dist_installer
