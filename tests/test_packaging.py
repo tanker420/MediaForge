@@ -75,3 +75,86 @@ def test_workflow_references_existing_script():
     for m in re.finditer(r"-File\s+([\w\\/.]+)", src):
         rel = m.group(1).replace("\\", os.sep).replace("/", os.sep)
         assert os.path.isfile(os.path.join(ROOT, rel)), f"引用了不存在的脚本 {rel}"
+
+
+# ---------------------------------------------------------------------------
+# PyInstaller spec 路径测试
+#
+# 回归背景：spec 中 version="packaging/version_info.txt" 用了相对路径，
+# PyInstaller 以 spec 所在目录为基准解析，拼成 packaging/packaging/...
+# 导致 FileNotFoundError，构建在最后一步失败。
+# ---------------------------------------------------------------------------
+SPEC = os.path.join(ROOT, "packaging", "MediaForge.spec")
+
+
+def _eval_spec(simulate_windows: bool = False) -> dict:
+    """执行 spec 并捕获传给各构建器的参数。"""
+    src = open(SPEC, encoding="utf-8").read()
+    if simulate_windows:
+        src = src.replace('os.name == "nt"', "True")
+
+    captured: dict = {}
+
+    class Rec:
+        def __init__(self, name):
+            self.n = name
+            self.pure = []
+            self.scripts = []
+            self.binaries = []
+            self.datas = []
+
+        def __call__(self, *a, **k):
+            captured[self.n] = (a, k)
+            return self
+
+    ns = {n: Rec(n) for n in ("Analysis", "PYZ", "EXE", "COLLECT")}
+    cwd = os.getcwd()
+    os.chdir(ROOT)
+    try:
+        exec(compile(src, SPEC, "exec"), ns)
+    finally:
+        os.chdir(cwd)
+    return captured
+
+
+def test_spec_is_executable():
+    assert _eval_spec(), "spec 未能正常执行"
+
+
+def test_spec_entry_script_is_absolute_and_exists():
+    script = _eval_spec()["Analysis"][0][0][0]
+    assert os.path.isabs(script), "入口脚本应使用绝对路径"
+    assert os.path.isfile(script)
+
+
+def test_spec_icon_path_resolves():
+    icon = _eval_spec()["EXE"][1]["icon"]
+    if icon:
+        assert os.path.isabs(icon)
+        assert os.path.isfile(icon)
+
+
+def test_spec_version_file_absolute_on_windows():
+    """version 必须是绝对路径，否则会被拼成 packaging/packaging/..."""
+    version = _eval_spec(simulate_windows=True)["EXE"][1]["version"]
+    assert version, "Windows 下应设置版本信息文件"
+    assert os.path.isabs(version), (
+        "version 必须用绝对路径：PyInstaller 以 spec 所在目录为基准解析相对路径"
+    )
+    assert os.path.isfile(version), f"版本文件不存在：{version}"
+
+
+def test_spec_paths_resolve_relative_to_specdir():
+    """模拟 PyInstaller 的解析规则，确保没有路径会被重复拼接。"""
+    cap = _eval_spec(simulate_windows=True)
+    specdir = os.path.dirname(SPEC)
+    values = [
+        cap["Analysis"][0][0][0],
+        cap["EXE"][1].get("icon"),
+        cap["EXE"][1].get("version"),
+    ]
+    for val in values:
+        if not val:
+            continue
+        resolved = val if os.path.isabs(val) else os.path.join(specdir, val)
+        assert os.path.isfile(resolved), f"路径解析后不存在：{resolved}"
