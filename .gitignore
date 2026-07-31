@@ -18,3 +18,4 @@ bin/
 # 系统
 .DS_Store
 Thumbs.db
+.github/workflows/build-windows.yml
