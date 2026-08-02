@@ -2,11 +2,11 @@
 # Usage: powershell -ExecutionPolicy Bypass -File packaging\ci\build.ps1
 $ErrorActionPreference = "Stop"
 
-Write-Host "==> [1/5] Installing Python dependencies"
+Write-Host "==> [1/6] Installing Python dependencies"
 python -m pip install --upgrade pip
 pip install -r requirements.txt pyinstaller
 
-Write-Host "==> [2/5] Downloading and bundling FFmpeg"
+Write-Host "==> [2/6] Downloading and bundling FFmpeg"
 New-Item -ItemType Directory -Force -Path bin | Out-Null
 # Use FULL builds: the "essentials" variant lacks libsvtav1 / libaom-av1 / libvpx etc.
 $urls = @(
@@ -68,7 +68,40 @@ if ($missing.Count -gt 0) {
   Write-Host "    all key encoders present"
 }
 
-Write-Host "==> [3/5] Running PyInstaller"
+# Version comes from APP_VERSION (set by CI from git tag); local builds fall back.
+$version = if ($env:APP_VERSION) { $env:APP_VERSION } else { "0.0.0-dev" }
+Write-Host "==> [3/6] Stamping version: $version"
+
+# Keep in-app VERSION strings in sync with the installer (best-effort).
+foreach ($py in @("app\cli.py", "app\ui\main_window.py")) {
+  if (Test-Path $py) {
+    $txt = Get-Content $py -Raw
+    $txt = $txt -replace 'VERSION\s*=\s*"[^"]*"', "VERSION = `"$version`""
+    Set-Content -Path $py -Value $txt -NoNewline -Encoding utf8
+  }
+}
+
+# Update Windows PE version resource (numeric tuple + display strings).
+$viPath = "packaging\version_info.txt"
+if (Test-Path $viPath) {
+  $nums = @()
+  foreach ($p in (($version -split '[-+]')[0] -split '\.')) {
+    $n = 0
+    if ($p -match '^\d+$') { $n = [int]$p }
+    $nums += $n
+  }
+  while ($nums.Count -lt 4) { $nums += 0 }
+  $tuple = ($nums[0..3] -join ", ")
+  $disp = "$($nums[0]).$($nums[1]).$($nums[2]).$($nums[3])"
+  $vi = Get-Content $viPath -Raw
+  $vi = $vi -replace 'filevers=\([^)]+\)', "filevers=($tuple)"
+  $vi = $vi -replace 'prodvers=\([^)]+\)', "prodvers=($tuple)"
+  $vi = $vi -replace "StringStruct\('FileVersion', '[^']*'\)", "StringStruct('FileVersion', '$disp')"
+  $vi = $vi -replace "StringStruct\('ProductVersion', '[^']*'\)", "StringStruct('ProductVersion', '$disp')"
+  Set-Content -Path $viPath -Value $vi -NoNewline -Encoding utf8
+}
+
+Write-Host "==> [4/6] Running PyInstaller"
 # Sanity check: make sure we are building the fixed spec, not a stale checkout.
 $specText = Get-Content packaging\MediaForge.spec -Raw
 if ($specText -match 'version\s*=\s*"packaging/version_info.txt"') {
@@ -80,11 +113,11 @@ pyinstaller packaging/MediaForge.spec --noconfirm --clean
 $exe = "dist\MediaForge\MediaForge.exe"
 if (-not (Test-Path $exe)) { throw "exe was not produced" }
 
-Write-Host "==> [4/5] Smoke test"
+Write-Host "==> [5/6] Smoke test"
 & $exe doctor
 if ($LASTEXITCODE -ne 0) { throw "doctor command failed with exit code $LASTEXITCODE" }
 
-Write-Host "==> [5/5] Building installer with Inno Setup"
+Write-Host "==> [6/6] Building installer with Inno Setup"
 $iscc = "${env:ProgramFiles(x86)}\Inno Setup 6\ISCC.exe"
 if (-not (Test-Path $iscc)) {
   Write-Host "    Inno Setup not found, installing..."
@@ -96,7 +129,8 @@ if (-not (Test-Path $iscc)) {
   if (-not $found) { throw "ISCC.exe (Inno Setup compiler) not found" }
   $iscc = $found.FullName
 }
-& $iscc packaging\installer.iss
+Write-Host "    installer version: $version"
+& $iscc "/DMyAppVersion=$version" packaging\installer.iss
 if ($LASTEXITCODE -ne 0) { throw "Inno Setup compilation failed" }
 
 Get-ChildItem dist_installer\*.exe | ForEach-Object {

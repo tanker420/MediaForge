@@ -3,7 +3,9 @@
 
 #define MyAppName "MediaForge"
 #define MyAppNameCN "MediaForge 全能格式转换器"
-#define MyAppVersion "1.0.0"
+#ifndef MyAppVersion
+#define MyAppVersion "0.0.0-dev"
+#endif
 #define MyAppPublisher "MediaForge"
 #define MyAppExeName "MediaForge.exe"
 
