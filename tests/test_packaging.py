@@ -12,7 +12,9 @@ import pytest
 
 ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 PS1 = os.path.join(ROOT, "packaging", "ci", "build.ps1")
-WF = os.path.join(ROOT, "packaging", "ci", "build-windows.yml")
+# Real workflow used by GitHub Actions (not the packaging/ci reference template).
+WF = os.path.join(ROOT, ".github", "workflows", "build-windows.yml")
+ISS = os.path.join(ROOT, "packaging", "installer.iss")
 
 
 def test_build_script_exists():
@@ -57,8 +59,16 @@ def test_build_script_brackets_balanced():
 def test_build_script_has_required_steps():
     src = open(PS1, encoding="utf-8").read()
     for kw in ("requirements.txt", "MediaForge.spec",
-               "installer.iss", "dist_installer"):
+               "installer.iss", "dist_installer",
+               "APP_VERSION", "/DMyAppVersion="):
         assert kw in src, f"缺少关键步骤：{kw}"
+
+
+def test_installer_iss_version_is_overridable():
+    """Inno Setup version must be overridable via /DMyAppVersion=..."""
+    src = open(ISS, encoding="utf-8").read()
+    assert "#ifndef MyAppVersion" in src
+    assert '#define MyAppVersion "0.0.0-dev"' in src
 
 
 def test_workflow_is_valid_yaml():
@@ -67,6 +77,21 @@ def test_workflow_is_valid_yaml():
     steps = d["jobs"]["build"]["steps"]
     assert len(steps) >= 4
     assert any("build.ps1" in str(s.get("run", "")) for s in steps)
+
+
+def test_workflow_tag_driven_release():
+    """Tag push builds + releases; manual dispatch only builds."""
+    yaml = pytest.importorskip("yaml")
+    d = yaml.safe_load(open(WF, encoding="utf-8"))
+    on = d["on"] if "on" in d else d[True]  # PyYAML may parse 'on' as True
+    assert "workflow_dispatch" in on
+    assert "push" in on
+    assert "v*" in on["push"].get("tags", [])
+    assert d.get("permissions", {}).get("contents") == "write"
+    src = open(WF, encoding="utf-8").read()
+    assert "APP_VERSION" in src
+    assert "softprops/action-gh-release" in src
+    assert "github.ref_type == 'tag'" in src or 'github.ref_type == "tag"' in src
 
 
 def test_workflow_references_existing_script():

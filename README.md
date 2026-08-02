@@ -31,13 +31,13 @@
 
 ### 方式一：下载安装程序（推荐）
 
-前往 [Releases](../../releases) 下载 `MediaForge-1.0.0-Setup.exe`，双击安装即可。
+前往 [Releases](../../releases) 下载最新的 `MediaForge-*-Setup.exe`，双击安装即可。
 安装程序已内置 FFmpeg，**无需另外安装任何依赖**。
 
 安装选项包括：桌面快捷方式、加入系统 PATH、文件右键菜单「用 MediaForge 转换」。
 
 > 尚未发布 Release 时，可到 [Actions](../../actions) 页面下载最新构建的
-> `MediaForge-Windows-Setup` 产物（同时提供免安装的 Portable 版）。
+> `MediaForge-Windows-Setup-*` 产物。
 
 ### 方式二：从源码运行
 
@@ -111,20 +111,24 @@ mediaforge doctor
 packaging\build_windows.bat
 ```
 
-产物：`dist_installer\MediaForge-1.0.0-Setup.exe`（安装程序）与 `dist\MediaForge\`（免安装版）。
+产物：`dist_installer\MediaForge-<version>-Setup.exe`（安装程序）与 `dist\MediaForge\`（免安装版）。
+版本号默认 `0.0.0-dev`；设置环境变量 `APP_VERSION=1.2.0` 可覆盖。
 
-### 用 GitHub Actions 构建
+### 用 GitHub Actions 构建 / 发布
 
-**完全不懂技术？** 请看 [《如何生成安装程序》](如何生成安装程序.md)，3 步图文教程。
+**完全不懂技术？** 请看 [《如何生成安装程序》](如何生成安装程序.md)。
 
-工作流模板位于 `packaging/ci/build-windows.yml`，需手动复制到 `.github/workflows/` 启用一次
-（推送工作流文件需要 GitHub App 的 `workflows` 权限，故未直接入库）。
+工作流已就绪：`.github/workflows/build-windows.yml`。
 
-启用后到 Actions 页面点 `Run workflow` 即可：
-自动下载内置 FFmpeg → PyInstaller 打包 → 冒烟测试 → 编译 Inno Setup 安装程序 → 上传产物。
-打 `v*` 标签会自动发布 Release。
+| 触发方式 | 行为 |
+|---|---|
+| Actions 页面点 `Run workflow` | 只构建 + 上传 Artifact（不发版） |
+| `git tag v1.2.0 && git push origin v1.2.0` | 构建并自动创建 GitHub Release |
 
-实际的构建逻辑在 `packaging/ci/build.ps1`，本地 Windows 也可直接运行它。
+版本号**唯一来源**是 git tag（`v1.2.0` → 安装包 `MediaForge-1.2.0-Setup.exe`），
+程序内版本与 PE 版本资源也会同步写入。`v1.2.0-beta.1` 这类带 `-` 的 tag 会自动标为 Pre-release。
+
+实际构建逻辑在 `packaging/ci/build.ps1`，本地 Windows 也可直接运行它。
 
 ## 项目结构
 
