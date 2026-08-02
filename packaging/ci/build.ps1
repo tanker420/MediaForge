@@ -2,6 +2,24 @@
 # Usage: powershell -ExecutionPolicy Bypass -File packaging\ci\build.ps1
 $ErrorActionPreference = "Stop"
 
+# ---------------------------------------------------------------------------
+# UTF-8 helpers.
+# CRITICAL: the Python sources and version_info.txt contain Chinese text and are
+# saved as UTF-8.  In Windows PowerShell 5.1, Get-Content / Set-Content default
+# to the system ANSI code page (GBK / cp1252), NOT UTF-8.  If we read those files
+# without an explicit encoding, every Chinese character is silently mangled into
+# mojibake, which then gets baked into the built exe -> the installed app's UI
+# shows garbled text. So always read/write these files with explicit UTF-8.
+function Read-TextUtf8([string]$Path) {
+    return [System.IO.File]::ReadAllText($Path, [System.Text.Encoding]::UTF8)
+}
+# Write UTF-8 WITHOUT a BOM so we don't modify the repo's source files any more
+# than necessary (the version-stamping edits are the only intended change).
+function Write-TextUtf8NoBom([string]$Path, [string]$Content) {
+    $utf8NoBom = New-Object System.Text.UTF8Encoding($false)
+    [System.IO.File]::WriteAllText($Path, $Content, $utf8NoBom)
+}
+
 Write-Host "==> [1/6] Installing Python dependencies"
 python -m pip install --upgrade pip
 pip install -r requirements.txt pyinstaller
@@ -75,9 +93,10 @@ Write-Host "==> [3/6] Stamping version: $version"
 # Keep in-app VERSION strings in sync with the installer (best-effort).
 foreach ($py in @("app\cli.py", "app\ui\main_window.py")) {
   if (Test-Path $py) {
-    $txt = Get-Content $py -Raw
+    $fullPath = (Resolve-Path $py).Path
+    $txt = Read-TextUtf8 $fullPath
     $txt = $txt -replace 'VERSION\s*=\s*"[^"]*"', "VERSION = `"$version`""
-    Set-Content -Path $py -Value $txt -NoNewline -Encoding utf8
+    Write-TextUtf8NoBom $fullPath $txt
   }
 }
 
@@ -93,12 +112,13 @@ if (Test-Path $viPath) {
   while ($nums.Count -lt 4) { $nums += 0 }
   $tuple = ($nums[0..3] -join ", ")
   $disp = "$($nums[0]).$($nums[1]).$($nums[2]).$($nums[3])"
-  $vi = Get-Content $viPath -Raw
+  $viFull = (Resolve-Path $viPath).Path
+  $vi = Read-TextUtf8 $viFull
   $vi = $vi -replace 'filevers=\([^)]+\)', "filevers=($tuple)"
   $vi = $vi -replace 'prodvers=\([^)]+\)', "prodvers=($tuple)"
   $vi = $vi -replace "StringStruct\('FileVersion', '[^']*'\)", "StringStruct('FileVersion', '$disp')"
   $vi = $vi -replace "StringStruct\('ProductVersion', '[^']*'\)", "StringStruct('ProductVersion', '$disp')"
-  Set-Content -Path $viPath -Value $vi -NoNewline -Encoding utf8
+  Write-TextUtf8NoBom $viFull $vi
 }
 
 Write-Host "==> [4/6] Running PyInstaller"
