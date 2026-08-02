@@ -1,20 +1,73 @@
-name: 构建 Windows 安装程序
+name: Build & Release Windows Installer
 
 on:
-  workflow_dispatch:
+  workflow_dispatch:          # 手动触发：只构建，不发布
   push:
-    tags: ["v*"]
+    tags:
+      - "v*"                  # 打 v* 标签：构建并发布 Release
+
+permissions:
+  contents: write             # 创建 Release 必需
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true    # 避免重复构建浪费时长
 
 jobs:
   build:
     runs-on: windows-latest
+    timeout-minutes: 60
+
     steps:
-      - uses: actions/checkout@v4
-      - uses: actions/setup-python@v5
+      - name: 拉取代码
+        uses: actions/checkout@v4
+
+      - name: 安装 Python
+        uses: actions/setup-python@v5
         with:
           python-version: "3.12"
-      - run: powershell -ExecutionPolicy Bypass -File packaging\ci\build.ps1
-      - uses: actions/upload-artifact@v4
+          cache: "pip"        # 缓存依赖，加快后续构建
+
+      - name: 解析版本号
+        id: ver
+        shell: powershell
+        run: |
+          $version = "0.0.0-dev"
+          if ("${{ github.ref_type }}" -eq "tag" -and "${{ github.ref_name }}" -match '^v(.+)$') {
+            $version = $Matches[1]
+          }
+          "version=$version" | Out-File -FilePath $env:GITHUB_OUTPUT -Append
+          Write-Host "Installer version: $version"
+
+      - name: 构建 Windows 安装程序
+        shell: powershell
+        env:
+          APP_VERSION: ${{ steps.ver.outputs.version }}
+        run: powershell -NoProfile -ExecutionPolicy Bypass -File packaging\ci\build.ps1
+
+      - name: 生成 SHA256 校验文件
+        shell: powershell
+        run: |
+          Get-ChildItem dist_installer\*.exe | ForEach-Object {
+            $hash = (Get-FileHash $_.FullName -Algorithm SHA256).Hash.ToLower()
+            "$hash  $($_.Name)" | Out-File -FilePath "dist_installer\$($_.Name).sha256" -Encoding ascii
+          }
+
+      - name: 上传 Actions Artifact
+        uses: actions/upload-artifact@v4
         with:
-          name: MediaForge-Windows-Setup
+          name: MediaForge-Windows-Setup-${{ steps.ver.outputs.version }}
           path: dist_installer/*
+          retention-days: 14
+
+      - name: 发布 GitHub Release
+        if: github.ref_type == 'tag'
+        uses: softprops/action-gh-release@v2
+        with:
+          name: MediaForge ${{ github.ref_name }}
+          files: |
+            dist_installer/*.exe
+            dist_installer/*.sha256
+          generate_release_notes: true   # 自动生成更新日志
+          draft: false
+          prerelease: ${{ contains(github.ref_name, '-') }}  # v1.0.0-beta 自动标记为预发布
