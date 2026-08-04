@@ -6,7 +6,16 @@
 """
 import os
 
-ROOT = os.path.abspath(os.path.join(os.path.dirname(__file__), ".."))
+# PyInstaller 在 exec 执行 .spec 时，命名空间里没有 __file__（6.x 的限制），
+# 但会注入 SPEC 变量（spec 文件路径）。按优先级取项目根目录：
+#   PyInstaller 运行（SPEC 注入） -> 直接运行 spec（__file__ 存在） -> 当前目录
+if "SPEC" in globals():
+    ROOT = os.path.abspath(os.path.join(os.path.dirname(os.path.abspath(SPEC)), ".."))
+elif "__file__" in globals():
+    ROOT = os.path.abspath(os.path.join(os.path.dirname(os.path.abspath(__file__)), ".."))
+else:
+    ROOT = os.getcwd()
+
 
 a = Analysis(
     [os.path.join(ROOT, "main.py")],
