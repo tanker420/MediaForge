@@ -1,0 +1,77 @@
+# ============================================================
+#  MediaForge Windows 安装包构建（GitHub Actions）
+#  触发方式：
+#   1. 手动触发（Actions 页面点 Run workflow）
+#   2. 推送 v* 标签（如 v1.0.0），自动构建并发布 Release
+# ============================================================
+name: 构建 Windows 安装包
+
+on:
+  workflow_dispatch:
+    inputs:
+      version:
+        description: "版本号（默认从 git describe 读取）"
+        required: false
+        default: ""
+  push:
+    tags: ["v*"]
+
+permissions:
+  contents: write
+
+jobs:
+  build:
+    runs-on: windows-latest
+    steps:
+      - name: 检出代码
+        uses: actions/checkout@v4
+
+      - name: 设置 Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+          cache: pip
+
+      - name: 执行构建脚本
+        shell: pwsh
+        env:
+          # 代码签名证书（base64 编码的 .pfx）—— 可选；缺证书时跳过签名。
+          # 仓库 Secret 配置：Settings -> Secrets and variables -> Actions
+          #   CODE_SIGNING_PFX_BASE64 : base64 编码的 .pfx 文件内容
+          #   CODE_SIGNING_PFX_PASSWORD : pfx 解锁密码
+          CODE_SIGNING_PFX_BASE64: ${{ secrets.CODE_SIGNING_PFX_BASE64 }}
+          CODE_SIGNING_PFX_PASSWORD: ${{ secrets.CODE_SIGNING_PFX_PASSWORD }}
+        run: |
+          # 使用 PowerShell 7（windows-latest 预装）：默认 UTF-8、无 5.1 的
+          # 无 BOM 编码坑。版本号优先取手动输入，其次最新 v* 标签，兜底 1.0.0。
+          $ver = "${{ inputs.version }}"
+          if ([string]::IsNullOrWhiteSpace($ver)) {
+            $tag = git tag --list 'v*' --sort=-v:refname 2>$null | Select-Object -First 1
+            if ($tag) { $ver = $tag.TrimStart('v') } else { $ver = "1.0.0" }
+          }
+          # 解码 PFX（如果有）；写到仓库临时目录、构建后删除
+          $pfx = ""
+          if (-not [string]::IsNullOrWhiteSpace("${{ env.CODE_SIGNING_PFX_BASE64 }}")) {
+            $pfx = Join-Path $env:RUNNER_TEMP "mediaforge_signing.pfx"
+            [System.Text.Encoding]::UTF8.GetString(
+              [System.Convert]::FromBase64String("${{ env.CODE_SIGNING_PFX_BASE64 }}")
+            ) | Set-Content -LiteralPath $pfx -Encoding Byte -NoNewline
+          }
+          $pw = "${{ env.CODE_SIGNING_PFX_PASSWORD }}"
+          powershell -ExecutionPolicy Bypass -File packaging\ci\build.ps1 `
+            -Version $ver -PfxPath $pfx -PfxPassword $pw
+          if ($pfx) { Remove-Item -LiteralPath $pfx -Force -ErrorAction SilentlyContinue }
+
+      - name: 上传安装包（Artifact）
+        uses: actions/upload-artifact@v4
+        with:
+          name: MediaForge-Setup
+          path: dist_installer/*.exe
+          if-no-files-found: error
+
+      - name: 发布 Release（推送标签时）
+        if: startsWith(github.ref, 'refs/tags/')
+        uses: softprops/action-gh-release@v2
+        with:
+          files: dist_installer/*.exe
+          generate_release_notes: true
