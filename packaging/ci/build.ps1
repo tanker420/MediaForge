@@ -25,21 +25,24 @@ Write-Host "==> MediaForge build started, version: $Version"
 # Single source of truth for runtime version is app\__init__.py.
 # PyInstaller reads version_info.txt at build time, so we rewrite
 # the file_version / product_version / version strings in place.
+#
+# CRITICAL (encoding): version_info.txt is UTF-8 WITHOUT BOM.
+# Never use Get-Content/Set-Content here - Windows PowerShell 5.1
+# decodes BOM-less UTF-8 as GBK/ANSI and corrupts the Chinese text.
+# Use .NET APIs with an explicit UTF-8 encoding (identical on PS5.1 and PS7).
 $versionInfoPath = "packaging\version_info.txt"
 if (Test-Path $versionInfoPath) {
     $parts = $Version.Split('.')
     if ($parts.Count -lt 3) { $parts = @($parts[0], "0", "0") }
     $tuple = "($($parts[0]), $($parts[1]), $($parts[2]), 0)"
-    $vi = Get-Content $versionInfoPath -Raw
+    $utf8NoBom = New-Object System.Text.UTF8Encoding($false)
+    $vi = [System.IO.File]::ReadAllText((Resolve-Path $versionInfoPath), $utf8NoBom)
     $vi = $vi -replace 'filevers=\([^)]*\)', "filevers=$tuple"
     $vi = $vi -replace 'prodvers=\([^)]*\)', "prodvers=$tuple"
     $vi = $vi -replace "u'FileVersion', u'[^']*'", "u'FileVersion', u'$Version'"
     $vi = $vi -replace "u'ProductVersion', u'[^']*'", "u'ProductVersion', u'$Version'"
-    # Encoding note: keep it as the original UTF-16 LE (PyInstaller parses
-    # the BOM either way, and Git diff stays clean).
-    $enc = "utf-16"
-    Set-Content -LiteralPath $versionInfoPath -Value $vi -Encoding $enc
-    Write-Host "==> Synced version $Version into $versionInfoPath"
+    [System.IO.File]::WriteAllText((Resolve-Path $versionInfoPath), $vi, $utf8NoBom)
+    Write-Host "==> Synced version $Version into $versionInfoPath (UTF-8, no BOM)"
 } else {
     Write-Host "==> WARNING: $versionInfoPath not found, version sync skipped"
 }
