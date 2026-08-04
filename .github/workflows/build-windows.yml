@@ -32,12 +32,16 @@ jobs:
           python-version: "3.11"
           cache: pip
 
-      - name: 执行构建脚本
+       - name: 执行构建脚本
         shell: powershell
         run: |
+          # 注意：GitHub Actions 的 powershell 是 5.1，且原生命令非零退出码
+          # 会让步骤直接失败。这里刻意避免 `git describe`（无 tag 时退出码 128），
+          # 改用不会失败的 `git tag --list` 取版本号。
           $ver = "${{ inputs.version }}"
           if ([string]::IsNullOrWhiteSpace($ver)) {
-            $ver = (git describe --tags --abbrev=0 2>$null) ?? "1.0.0"
+            $tag = git tag --list 'v*' --sort=-v:refname 2>$null | Select-Object -First 1
+            if ($tag) { $ver = $tag.TrimStart('v') } else { $ver = "1.0.0" }
           }
           powershell -ExecutionPolicy Bypass -File packaging\ci\build.ps1 -Version $ver
 
