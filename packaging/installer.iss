@@ -38,22 +38,11 @@ PrivilegesRequiredOverridesAllowed=dialog
 MinVersion=10.0
 
 ; ---------- 界面语言：简体中文优先，英文备选 ----------
+; ChineseSimplified.isl 随仓库分发（GitHub Actions 镜像的 Inno Setup 不含此文件），
+; 路径用 {#SourcePath}（ISPP 变量 = 本脚本所在目录）定位，与编译时工作目录无关。
 [Languages]
-Name: "chinesesimplified"; MessagesFile: "compiler:Languages\ChineseSimplified.isl"
+Name: "chinesesimplified"; MessagesFile: "{#SourcePath}languages\ChineseSimplified.isl"
 Name: "english"; MessagesFile: "compiler:Default.isl"
-
-; ---------- 中文文案覆盖 ----------
-[Messages]
-SetupWindowTitle=安装 - {#MyAppNameCN} {#MyAppVersion}
-WelcomeLabel1=欢迎使用 {#MyAppNameCN}
-WelcomeLabel2=本向导将引导您完成安装。%n%n建议先关闭正在运行的 {#MyAppName}，再继续安装。
-FinishedLabel=已成功安装 {#MyAppNameCN}。点击“完成”退出安装向导。
-ButtonInstall=安装(&I)
-ButtonNext=下一步(&N) >
-ButtonBack=< 上一步(&B)
-ButtonCancel=取消
-ButtonFinish=完成(&F)
-ButtonBrowse=浏览(&R)...
 
 [Tasks]
 Name: "desktopicon"; Description: "创建桌面快捷方式"; GroupDescription: "附加快捷方式："
