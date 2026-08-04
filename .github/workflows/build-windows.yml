@@ -32,7 +32,7 @@ jobs:
           python-version: "3.11"
           cache: pip
 
-       - name: 执行构建脚本
+      - name: 执行构建脚本
         shell: powershell
         run: |
           # 注意：GitHub Actions 的 powershell 是 5.1，且原生命令非零退出码
