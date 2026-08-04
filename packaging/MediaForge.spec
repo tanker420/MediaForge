@@ -16,15 +16,23 @@ elif "__file__" in globals():
 else:
     ROOT = os.getcwd()
 
+datas = [
+    # 图标资源随程序一起分发（运行期 QIcon 会从相对路径读取）
+    (os.path.join(ROOT, "app", "resources"), os.path.join("app", "resources")),
+]
+# FFmpeg 引擎：build.ps1 会先把 ffmpeg.exe / ffprobe.exe 下载到仓库 bin/，
+# 这里随程序打包进 _internal/bin/（运行期 ffprobe._candidates 从该目录查找）。
+# 本地开发目录没有 bin/ 时跳过，不影响打包。
+# 缺失时程序只剩图片转换可用，视频/音频转换会报"未检测到 FFmpeg"。
+_bin_dir = os.path.join(ROOT, "bin")
+if os.path.isdir(_bin_dir):
+    datas.append((_bin_dir, "bin"))
 
 a = Analysis(
     [os.path.join(ROOT, "main.py")],
     pathex=[ROOT],
     binaries=[],
-    datas=[
-        # 图标资源随程序一起分发（运行期 QIcon 会从相对路径读取）
-        (os.path.join(ROOT, "app", "resources"), os.path.join("app", "resources")),
-    ],
+    datas=datas,
     hiddenimports=[
         "pillow_heif",          # AVIF / HEIC 图片支持（可选依赖，缺失时自动降级）
     ],
