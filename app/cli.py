@@ -1,307 +1,247 @@
-"""MediaForge 命令行接口。
+"""命令行批量转换入口（可选）。
 
-示例：
-    mediaforge convert in.mkv -o out/ -f mp4 --video-codec libx265 --crf 24
-    mediaforge convert ./photos -f webp --quality 80 --width 1920 -r
-    mediaforge preset "MP3 320k 高音质" song.flac -o out/
-    mediaforge info movie.mp4
-    mediaforge list-formats
+图形界面是默认启动方式（运行 main.py 即可）；本模块为脚本化、
+批量处理、无头服务器等场景提供等价的命令行能力。
+
+修复说明（A1）：`-f/--format` 与 `--out-format` 此前共用同一个
+argparse dest，导致 --help 中互相覆盖。现改为：
+  -f/--kind  媒体类别（video/audio/image）
+  -F/--out-format  输出格式扩展名
+互不冲突。
 """
 from __future__ import annotations
 
 import argparse
-import json
 import os
 import sys
-import threading
+from typing import Any
 
 from .core import formats as F
-from .core import naming, presets
+from .core import presets as P
 from .core.converter import ConversionQueue, Job, Status
-from .core.ffprobe import available_encoders, ffmpeg_version, probe
-from .core.naming import human_size, human_time
+from .core.ffmpeg_builder import preview_command
+from .core.ffprobe import ffmpeg_path, ffmpeg_version, invalidate_caches
+from .core.naming import build_output_path, collect_files, dedupe
 
-APP_NAME = "MediaForge"
-VERSION = "1.0.0"
+__version__ = "1.0.0"
 
 
-# --------------------------------------------------------------------------
-def _add_param_args(parser: argparse.ArgumentParser) -> None:
-    """把所有已知参数注册成 --xxx 命令行选项。"""
-    # 与 convert 子命令自身选项冲突的键，改用带前缀的长选项
-    reserved = {"preset": "--enc-preset", "format": "--out-format",
-                "quiet": "--be-quiet", "pattern": "--name-pattern"}
-    # 这些键在不同编码器下取值集合不同，放开为自由文本，避免误拒合法值
-    free_text = {"preset", "profile", "level", "tune", "pix_fmt", "sample_fmt"}
-    seen: set[str] = set()
-    groups = (
-        ("通用", F.GENERAL_PARAMS),
-        ("视频处理", F.VIDEO_FILTER_PARAMS),
-        ("音频处理", F.AUDIO_FILTER_PARAMS),
-        ("图片", F.IMAGE_PARAMS),
+def build_parser() -> argparse.ArgumentParser:
+    parser = argparse.ArgumentParser(
+        prog="mediaforge",
+        description="MediaForge 全能媒体格式转换器（命令行模式）",
+        epilog="示例：\n"
+               "  mediaforge -i 视频.mp4 -F mkv -p video_codec=copy -p audio_codec=copy   # 仅换容器\n"
+               "  mediaforge -i 目录 -F mp3 -p audio_bitrate=192k --workers 4             # 批量压音频\n"
+               "  mediaforge -i 图片.png -F webp --preset \"WebP 有损\"                     # 图片批处理\n"
+               "  mediaforge --list-formats                                              # 查看支持的格式",
+        formatter_class=argparse.RawDescriptionHelpFormatter,
     )
-    codec_params: list[F.Param] = []
-    for c in list(F.VIDEO_CODECS.values()) + list(F.AUDIO_CODECS.values()):
-        codec_params.extend(c.params)
+    parser.add_argument("--version", action="version", version=f"MediaForge {__version__}")
 
-    for title, pool in groups + (("编码器", tuple(codec_params)),):
-        g = parser.add_argument_group(f"{title}参数")
-        for p in pool:
-            if p.key in seen or p.key.startswith("_"):
-                continue
-            seen.add(p.key)
-            flag = reserved.get(p.key) or ("--" + p.key.replace("_", "-"))
-            help_text = p.help or p.label
-            if p.type == "bool":
-                g.add_argument(flag, dest=p.key, action="store_true", default=None,
-                               help=f"{p.label}。{help_text}")
-                g.add_argument("--no-" + p.key.replace("_", "-"), dest=p.key,
-                               action="store_false", default=None,
-                               help=argparse.SUPPRESS)
-            elif p.type == "int":
-                g.add_argument(flag, dest=p.key, type=int, default=None, help=help_text)
-            elif p.type == "float":
-                g.add_argument(flag, dest=p.key, type=float, default=None, help=help_text)
-            elif p.type == "choice" and p.choices and p.key not in free_text:
-                g.add_argument(flag, dest=p.key, choices=[c for c in p.choices if c],
-                               default=None, help=help_text)
-            else:
-                g.add_argument(flag, dest=p.key, default=None, help=help_text)
+    src = parser.add_argument_group("输入与输出")
+    src.add_argument("-i", "--input", nargs="+", action="append", metavar="PATH",
+                     help="输入文件或目录，可多次指定；目录会递归收集支持的媒体文件")
+    src.add_argument("-o", "--out-dir", metavar="DIR", help="输出目录（默认与源文件相同）")
+    src.add_argument("-F", "--out-format", dest="out_format", metavar="EXT",
+                     help="输出格式扩展名，如 mp4 / mp3 / png（与 --preset 二选一，通常都要给）")
+    src.add_argument("-f", "--kind", dest="kind", choices=(F.VIDEO, F.AUDIO, F.IMAGE),
+                     help="媒体类别过滤；不填则按第一个输入文件自动识别")
+
+    opt = parser.add_argument_group("转换选项")
+    opt.add_argument("--preset", metavar="NAME", help="应用内置/用户预设，如 “MP4 通用高质量”")
+    opt.add_argument("-p", "--param", dest="params", action="append", default=[],
+                     metavar="KEY=VALUE",
+                     help="覆盖参数，可多次使用，如 -p crf=18 -p two_pass=1 -p width=1920")
+    opt.add_argument("--vcodec", dest="video_codec", help="视频编码器（如 libx264 / h264_nvenc / copy）")
+    opt.add_argument("--acodec", dest="audio_codec", help="音频编码器（如 aac / libopus / copy）")
+    opt.add_argument("--pattern", default="{name}", help="输出命名模板，默认 {name}（原文件名）")
+    opt.add_argument("--workers", type=int, default=2, help="并行任务数（默认 2）")
+    overwrite = opt.add_mutually_exclusive_group()
+    overwrite.add_argument("--overwrite", dest="overwrite", action="store_true",
+                           help="覆盖已存在的同名文件（默认行为）")
+    overwrite.add_argument("--no-overwrite", dest="overwrite", action="store_false",
+                           help="跳过已存在的同名文件（自动追加 (1)(2)… 后缀）")
+
+    info = parser.add_argument_group("信息与维护")
+    info.add_argument("--dry-run", action="store_true",
+                      help="只打印将要执行的命令，不实际转换")
+    info.add_argument("--list-formats", action="store_true", help="列出支持的输出格式")
+    info.add_argument("--list-presets", action="store_true", help="列出全部预设")
+    info.add_argument("--list-codecs", action="store_true", help="列出当前 ffmpeg 可用的编码器")
+    info.add_argument("--refresh", action="store_true",
+                      help="清除 ffmpeg 探测缓存后退出（安装/更换 ffmpeg 后使用）")
+    return parser
 
 
-def _collect_params(args: argparse.Namespace) -> dict:
-    skip = {"command", "inputs", "outdir", "format", "recursive", "pattern",
-            "workers", "dry_run", "use_preset", "json", "yes", "quiet",
-            "func"}
-    return {k: v for k, v in vars(args).items() if k not in skip and v is not None}
+def _parse_param(text: str) -> tuple[str, str]:
+    if "=" not in text:
+        raise ValueError(f"参数格式应为 KEY=VALUE：{text}")
+    key, _, value = text.partition("=")
+    return key.strip(), value.strip()
 
 
-# --------------------------------------------------------------------------
-def cmd_convert(args: argparse.Namespace) -> int:
-    exts = None
-    ext_out = (args.format or "").lower().lstrip(".")
-    files = naming.collect_files(args.inputs, args.recursive, exts)
+def _collect_params(args: argparse.Namespace, kind: str,
+                    ext: str, preset: P.Preset | None) -> dict[str, Any]:
+    """按 默认值 → 预设 → 命令行覆盖 的顺序合并参数。"""
+    params = F.default_params_for(kind)
+    if preset:
+        params.update(preset.params)
+    for text in args.params:
+        key, value = _parse_param(text)
+        params[key] = value
+    if args.video_codec is not None:
+        params["video_codec"] = args.video_codec
+    if args.audio_codec is not None:
+        params["audio_codec"] = args.audio_codec
+    if args.overwrite is not None:
+        params["overwrite"] = args.overwrite
+    if kind != F.IMAGE:
+        fmt = F.find_format(ext, kind)
+        if fmt:
+            params.setdefault("video_codec", fmt.video_codecs[0] if fmt.video_codecs else "")
+            params.setdefault("audio_codec", fmt.audio_codecs[0] if fmt.audio_codecs else "")
+    return params
+
+
+def _print_formats() -> None:
+    print("支持的输出格式：")
+    for kind, title in ((F.VIDEO, "视频"), (F.AUDIO, "音频"), (F.IMAGE, "图片")):
+        print(f"\n【{title}】")
+        for f in F.formats_for(kind):
+            print(f"  .{f.ext:<8} {f.label}" + (f"（{f.notes}）" if f.notes else ""))
+
+
+def _print_presets() -> None:
+    print("可用预设：")
+    for kind, title in ((F.VIDEO, "视频"), (F.AUDIO, "音频"), (F.IMAGE, "图片")):
+        print(f"\n【{title}】")
+        for p in P.all_presets(kind):
+            mark = "内置" if p.builtin else "用户"
+            print(f"  {p.name}  [{mark}]  {p.description}")
+
+
+def _print_codecs() -> None:
+    ff = ffmpeg_path()
+    if not ff:
+        print("未找到 ffmpeg，无法列出编码器。", file=sys.stderr)
+        return
+    from .core.ffprobe import available_encoders
+    encs = sorted(available_encoders())
+    print(f"当前 ffmpeg（{ff}）可用编码器 {len(encs)} 个：")
+    print(" ".join(encs))
+
+
+def _resolve_inputs(paths: list[str], kind: str) -> list[str]:
+    # argparse `action="append" nargs="+"` 会嵌套一层（每条 -i 贡献一个子列表）
+    flat = [p for chunk in paths for p in (chunk if isinstance(chunk, list) else [chunk])]
+    pool = {F.VIDEO: F.INPUT_VIDEO_EXT, F.AUDIO: F.INPUT_AUDIO_EXT, F.IMAGE: F.INPUT_IMAGE_EXT}[kind]
+    return collect_files(flat, recursive=True, exts=pool)
+
+
+def _run(args: argparse.Namespace) -> int:
+    if not args.input:
+        print("错误：请用 -i/--input 指定输入文件或目录（--help 查看用法）。", file=sys.stderr)
+        return 2
+
+    preset = P.find_preset(args.preset) if args.preset else None
+    if args.preset and not preset:
+        print(f"错误：找不到预设 “{args.preset}”（用 --list-presets 查看）。", file=sys.stderr)
+        return 2
+
+    # 1. 确定媒体类别
+    kind = args.kind or (preset.kind if preset else None)
+    if not kind:
+        sample = _resolve_inputs(args.input, F.VIDEO) or _resolve_inputs(args.input, F.AUDIO) \
+            or _resolve_inputs(args.input, F.IMAGE)
+        kind = F.detect_kind(sample[0]) if sample else F.VIDEO
+
+    # 2. 确定输出扩展名
+    ext = (args.out_format or "").lower().lstrip(".")
+    if not ext and preset:
+        ext = preset.ext
+    if not ext:
+        print("错误：请用 -F/--out-format 指定输出格式，或使用 --preset。", file=sys.stderr)
+        return 2
+    if not F.find_format(ext, kind):
+        print(f"错误：.{ext} 不是 {kind} 类别的输出格式（--list-formats 查看）。", file=sys.stderr)
+        return 2
+
+    # 3. 收集输入文件
+    files = _resolve_inputs(args.input, kind)
     if not files:
-        print("未找到任何输入文件", file=sys.stderr)
+        print(f"错误：在输入中没有找到 {kind} 类别的媒体文件。", file=sys.stderr)
         return 2
+    print(f"共 {len(files)} 个文件待转换（{kind} / .{ext}）")
 
-    params = _collect_params(args)
-    if args.use_preset:
-        p = presets.find_preset(args.use_preset)
-        if not p:
-            print(f"未知预设：{args.use_preset}", file=sys.stderr)
-            return 2
-        merged = dict(p.params)
-        merged.update(params)
-        params = merged
-        ext_out = ext_out or p.ext
+    params = _collect_params(args, kind, ext, preset)
+    queue = ConversionQueue(workers=max(1, args.workers))
 
-    if not ext_out:
-        print("必须用 -f/--format 指定输出格式（或使用 --preset）", file=sys.stderr)
-        return 2
+    def build_jobs() -> list[Job]:
+        taken: set[str] = set()
+        jobs: list[Job] = []
+        for i, src in enumerate(files, 1):
+            out_dir = args.out_dir or os.path.dirname(src)
+            dst = build_output_path(src, out_dir, ext, args.pattern,
+                                    overwrite=bool(params.get("overwrite", True)), index=i)
+            dst = dedupe(dst, taken)
+            jobs.append(Job(src=src, dst=dst, params=dict(params), kind=kind))
+        return jobs
 
-    fmt = F.find_format(ext_out)
-    if not fmt:
-        print(f"不支持的输出格式：{ext_out}（用 list-formats 查看全部）", file=sys.stderr)
-        return 2
-
-    q = ConversionQueue(workers=args.workers)
-    taken: set[str] = set()
-    for i, src in enumerate(files, 1):
-        dst = naming.build_output_path(src, args.outdir, ext_out, args.pattern,
-                                       params.get("overwrite", True), i)
-        dst = naming.dedupe(dst, taken)
-        job = Job(src=src, dst=dst, params=dict(params), kind=fmt.kind)
-        q.add(job)
+    jobs = build_jobs()
 
     if args.dry_run:
-        from .core.ffmpeg_builder import preview_command
-        for job in q.jobs:
-            print(f"\n# {job.src}\n#   -> {job.dst}")
-            if job.kind != F.IMAGE:
-                print(preview_command(job.src, job.dst, job.params))
-            else:
-                print(f"[Pillow] 图片转换，参数：{json.dumps(job.params, ensure_ascii=False)}")
+        for j in jobs:
+            print(f"\n{j.src}\n  -> {j.dst}")
+            try:
+                print("  " + preview_command(j.src, j.dst, j.params))
+            except Exception as exc:  # noqa: BLE001
+                print(f"  （无法生成命令：{exc}）")
         return 0
 
-    total = len(q.jobs)
-    lock = threading.Lock()
-    state = {"done": 0}
-
-    def on_done(job: Job) -> None:
-        with lock:
-            state["done"] += 1
-            idx = state["done"]
-        if args.quiet:
-            return
-        mark = {Status.DONE: "✔", Status.FAILED: "✘",
-                Status.CANCELED: "－", Status.SKIPPED: "»"}.get(job.status, "?")
-        extra = ""
-        if job.status is Status.DONE:
-            extra = f"  {human_size(job.out_size)}  用时 {human_time(job.elapsed)}"
-        elif job.status is Status.FAILED:
-            extra = f"  {job.message.splitlines()[0] if job.message else ''}"
-        print(f"[{idx}/{total}] {mark} {os.path.basename(job.dst)}{extra}", flush=True)
+    # 4. 执行
+    for j in jobs:
+        queue.add(j)
 
     def on_progress(job: Job) -> None:
-        if args.quiet or not sys.stdout.isatty():
-            return
-        bar = int(job.progress * 24)
-        sys.stdout.write(
-            f"\r  {job.name[:28]:<28} [{'█' * bar}{'·' * (24 - bar)}] "
-            f"{job.progress * 100:5.1f}% {job.speed:>6}  ")
-        sys.stdout.flush()
+        pct = int(job.progress * 100)
+        print(f"\r[{pct:3d}%] {job.name}  {job.message}  ", end="", flush=True)
 
-    q.on_job_done = on_done
-    q.on_progress = on_progress
-    q.start()
-    for t in q._threads:  # noqa: SLF001
-        t.join()
-    if not args.quiet and sys.stdout.isatty():
-        sys.stdout.write("\r" + " " * 78 + "\r")
+    queue.on_progress = on_progress
+    queue.start()
+    queue.wait()
 
-    ok = sum(1 for j in q.jobs if j.status is Status.DONE)
-    failed = [j for j in q.jobs if j.status is Status.FAILED]
-    if not args.quiet:
-        print(f"\n完成 {ok}/{total}，失败 {len(failed)}")
+    done = [j for j in jobs if j.status is Status.DONE]
+    failed = [j for j in jobs if j.status is Status.FAILED]
+    skipped = [j for j in jobs if j.status is Status.SKIPPED]
+    canceled = [j for j in jobs if j.status is Status.CANCELED]
+    print("\n" + "=" * 48)
+    print(f"完成 {len(done)} 个，失败 {len(failed)} 个，跳过 {len(skipped)} 个，取消 {len(canceled)} 个")
     for j in failed:
-        print(f"  ✘ {j.name}: {j.message}", file=sys.stderr)
+        print(f"  ✗ {j.name}: {j.message}")
+    for j in done:
+        print(f"  ✓ {j.dst}")
     return 1 if failed else 0
 
 
-def cmd_info(args: argparse.Namespace) -> int:
-    for path in args.inputs:
-        info = probe(path)
-        if args.json:
-            print(json.dumps({
-                "path": info.path, "duration": info.duration, "size": info.size,
-                "bit_rate": info.bit_rate, "format": info.format_name,
-                "streams": [vars(s) for s in info.streams],
-            }, ensure_ascii=False, indent=2))
-            continue
-        print(f"\n文件：{info.path}")
-        print(f"  容器：{info.format_name or '未知'}   大小：{human_size(info.size)}"
-              f"   时长：{human_time(info.duration)}")
-        if info.bit_rate:
-            print(f"  总码率：{info.bit_rate // 1000} kbps")
-        for s in info.streams:
-            if s.codec_type == "video":
-                print(f"  [视频 #{s.index}] {s.codec_name} {s.width}x{s.height} "
-                      f"{s.fps:.3f}fps {s.pix_fmt}")
-            elif s.codec_type == "audio":
-                print(f"  [音频 #{s.index}] {s.codec_name} {s.sample_rate}Hz "
-                      f"{s.channels}ch {s.bit_rate // 1000 if s.bit_rate else '?'}kbps "
-                      f"{s.language}")
-            else:
-                print(f"  [{s.codec_type} #{s.index}] {s.codec_name} {s.language}")
-    return 0
-
-
-def cmd_list_formats(args: argparse.Namespace) -> int:
-    for title, pool in (("视频", F.VIDEO_FORMATS), ("音频", F.AUDIO_FORMATS),
-                        ("图片", F.IMAGE_FORMATS)):
-        print(f"\n== {title}输出格式 ==")
-        for f in pool:
-            codecs = ""
-            if f.video_codecs:
-                codecs = "  视频编码: " + ", ".join(f.video_codecs[:5])
-            if f.audio_codecs:
-                codecs += "  音频编码: " + ", ".join(f.audio_codecs[:5])
-            print(f"  .{f.ext:<6} {f.label}{codecs}")
-    return 0
-
-
-def cmd_list_presets(args: argparse.Namespace) -> int:
-    for p in presets.all_presets(args.kind):
-        tag = "内置" if p.builtin else "自定义"
-        print(f"[{tag}][{p.kind}] {p.name}  -> .{p.ext}\n      {p.description}")
-    return 0
-
-
-def cmd_doctor(args: argparse.Namespace) -> int:
-    print(f"{APP_NAME} {VERSION}")
-    print(f"Python: {sys.version.split()[0]}")
-    print(f"FFmpeg: {ffmpeg_version()}")
-    encs = available_encoders()
-    print(f"可用编码器数量: {len(encs)}")
-    for group, pool in (("视频", F.VIDEO_CODECS), ("音频", F.AUDIO_CODECS)):
-        avail = [e for e in pool if e in encs or e == "copy"]
-        missing = [e for e in pool if e not in encs and e != "copy"]
-        print(f"  {group}: 可用 {len(avail)} 个" +
-              (f"，缺失 {', '.join(missing[:8])}{'…' if len(missing) > 8 else ''}"
-               if missing else ""))
-    try:
-        from PIL import Image, features
-        print(f"Pillow: {Image.__version__}  WebP:{features.check('webp')} "
-              f"JPEG2000:{features.check('jpg_2000')}")
-    except ImportError:
-        print("Pillow: 未安装（图片功能不可用）")
-    from .core.image_engine import HEIF_OK
-    print(f"HEIF/AVIF 支持: {'是' if HEIF_OK else '否'}")
-    return 0
-
-
-# --------------------------------------------------------------------------
-def build_parser() -> argparse.ArgumentParser:
-    p = argparse.ArgumentParser(
-        prog="mediaforge",
-        description=f"{APP_NAME} {VERSION} — 视频/音频/图片全格式转换工具",
-        formatter_class=argparse.ArgumentDefaultsHelpFormatter)
-    p.add_argument("-V", "--version", action="version", version=f"{APP_NAME} {VERSION}")
-    sub = p.add_subparsers(dest="command", required=True)
-
-    c = sub.add_parser("convert", help="转换文件或目录",
-                       formatter_class=argparse.ArgumentDefaultsHelpFormatter)
-    c.add_argument("inputs", nargs="+", help="输入文件或目录")
-    c.add_argument("-o", "--outdir", default="", help="输出目录，默认与源文件同目录")
-    c.add_argument("-f", "--format", default="", help="输出格式扩展名，如 mp4/mp3/webp")
-    c.add_argument("-p", "--preset", dest="use_preset", default="", help="使用预设名称")
-    c.add_argument("-r", "--recursive", action="store_true", help="递归处理子目录")
-    c.add_argument("--pattern", default="{name}",
-                   help="输出文件名模板，可用 {name}{ext}{date}{time}{index}{parent}")
-    c.add_argument("-j", "--workers", type=int, default=2, help="并发任务数")
-    c.add_argument("--dry-run", action="store_true", help="只打印命令不执行")
-    c.add_argument("-q", "--quiet", action="store_true", help="安静模式")
-    c.add_argument("--video-codec", dest="video_codec", default=None,
-                   choices=sorted(F.VIDEO_CODECS), help="视频编码器")
-    c.add_argument("--audio-codec", dest="audio_codec", default=None,
-                   choices=sorted(F.AUDIO_CODECS) + ["none"], help="音频编码器")
-    _add_param_args(c)
-    c.set_defaults(func=cmd_convert)
-
-    i = sub.add_parser("info", help="显示媒体信息")
-    i.add_argument("inputs", nargs="+")
-    i.add_argument("--json", action="store_true")
-    i.set_defaults(func=cmd_info)
-
-    lf = sub.add_parser("list-formats", help="列出所有支持的输出格式")
-    lf.set_defaults(func=cmd_list_formats)
-
-    lp = sub.add_parser("list-presets", help="列出所有预设")
-    lp.add_argument("--kind", choices=[F.VIDEO, F.AUDIO, F.IMAGE])
-    lp.set_defaults(func=cmd_list_presets)
-
-    d = sub.add_parser("doctor", help="检查运行环境与依赖")
-    d.set_defaults(func=cmd_doctor)
-
-    g = sub.add_parser("gui", help="启动图形界面")
-    g.set_defaults(func=lambda a: _launch_gui())
-    return p
-
-
-def _launch_gui() -> int:
-    from .ui.main_window import run
-    return run()
-
-
 def main(argv: list[str] | None = None) -> int:
-    parser = build_parser()
-    args = parser.parse_args(argv)
-    try:
-        return int(args.func(args) or 0)
-    except KeyboardInterrupt:
-        print("\n已中断", file=sys.stderr)
-        return 130
+    args = build_parser().parse_args(argv)
+
+    if args.refresh:
+        invalidate_caches()
+        print("ffmpeg 探测缓存已清除。")
+        return 0
+    if args.list_formats:
+        _print_formats()
+        return 0
+    if args.list_presets:
+        _print_presets()
+        return 0
+    if args.list_codecs:
+        _print_codecs()
+        return 0
+
+    return _run(args)
 
 
 if __name__ == "__main__":

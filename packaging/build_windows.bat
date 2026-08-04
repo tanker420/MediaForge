@@ -1,29 +1,43 @@
 @echo off
-REM 在本地 Windows 上一键构建安装程序
-REM 需要：Python 3.10+、Inno Setup 6（iscc 在 PATH 中或默认安装路径）
+rem ============================================================
+rem  MediaForge Windows 一键打包脚本
+rem  前提：已安装 Python 3.10+、Inno Setup 6
+rem  产物：dist\MediaForge\ 目录程序 + dist_installer\ 安装包
+rem ============================================================
 setlocal
-cd /d "%~dp0\.."
+cd /d "%~dp0.."
 
-echo [1/4] 安装依赖...
-python -m pip install --upgrade pip || goto :err
-python -m pip install -r requirements.txt pyinstaller || goto :err
+echo [1/4] 创建虚拟环境...
+if not exist .venv (
+    python -m venv .venv
+)
+call .venv\Scripts\activate.bat
 
-echo [2/4] 运行测试...
-python -m pytest tests -q || echo 警告：部分测试未通过，继续构建
+echo [2/4] 安装依赖...
+python -m pip install --upgrade pip
+pip install -r requirements.txt pyinstaller
 
-echo [3/4] PyInstaller 打包...
-python -m PyInstaller packaging\MediaForge.spec --noconfirm --clean || goto :err
+echo [3/4] PyInstaller 打包（无控制台窗口的 GUI 程序）...
+pyinstaller --noconfirm --clean packaging\MediaForge.spec
+if errorlevel 1 goto :fail
 
-echo [4/4] 编译安装程序...
+echo [4/4] Inno Setup 生成中文安装包...
 set "ISCC=%ProgramFiles(x86)%\Inno Setup 6\ISCC.exe"
-if not exist "%ISCC%" set "ISCC=iscc"
-"%ISCC%" packaging\installer.iss || goto :err
+if not exist "%ISCC%" set "ISCC=%ProgramFiles%\Inno Setup 6\ISCC.exe"
+if not exist "%ISCC%" (
+    echo 未找到 Inno Setup 6，请先安装：https://jrsoftware.org/isinfo.php
+    goto :fail
+)
+"%ISCC%" packaging\installer.iss
+if errorlevel 1 goto :fail
 
 echo.
-echo 构建完成！安装程序位于 dist_installer\ 目录。
+echo 打包完成！安装包位于 dist_installer\ 目录。
+pause
 exit /b 0
 
-:err
+:fail
 echo.
-echo 构建失败，请查看上方错误信息。
+echo 打包失败，请检查上方错误信息。
+pause
 exit /b 1

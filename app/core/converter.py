@@ -165,7 +165,10 @@ def run_job(job: Job, on_progress: ProgressCB | None = None,
             raise ValueError("源文件与目标文件相同")
 
         if job.kind == F.IMAGE:
-            image_engine.convert_image(job.src, job.dst, job.params)
+            try:
+                image_engine.convert_image(job.src, job.dst, job.params, cancel)
+            except image_engine.CanceledError:
+                raise Canceled from None
             job.progress = 1.0
         else:
             require_ffmpeg()
@@ -323,6 +326,11 @@ class ConversionQueue:
             t.join()
         if self.on_all_done:
             self.on_all_done(self.jobs)
+
+    def wait(self) -> None:
+        """阻塞直到所有工作线程结束（公开 API，替代直接访问 _threads）。"""
+        for t in list(self._threads):
+            t.join()
 
     def cancel(self) -> None:
         self._cancel.set()

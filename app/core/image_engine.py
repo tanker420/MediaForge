@@ -43,6 +43,16 @@ SAVE_FORMAT = {
 NO_ALPHA = {"JPEG", "PDF", "EPS", "PPM", "PCX", "DDS", "SGI", "MSP", "XBM", "JPEG2000"}
 
 
+class CanceledError(Exception):
+    """图片转换被用户取消。"""
+
+
+def _check_cancel(cancel: Any) -> None:
+    """在耗时的图片处理步骤之间检查取消标志。"""
+    if cancel is not None and cancel.is_set():
+        raise CanceledError
+
+
 def _i(p: dict[str, Any], k: str, d: int = 0) -> int:
     try:
         return int(float(p.get(k, d)))
@@ -81,7 +91,8 @@ def _flatten(img: Image.Image, background: str) -> Image.Image:
     return img.convert("RGB")
 
 
-def _apply_geometry(img: Image.Image, p: dict[str, Any]) -> Image.Image:
+def _apply_geometry(img: Image.Image, p: dict[str, Any], cancel: Any = None) -> Image.Image:
+    _check_cancel(cancel)
     if _b(p, "auto_orient", True):
         try:
             img = ImageOps.exif_transpose(img)
@@ -101,6 +112,7 @@ def _apply_geometry(img: Image.Image, p: dict[str, Any]) -> Image.Image:
                 img = img.resize((max(1, round(ow * h / oh)), h), resample)
         else:
             img = img.resize((w or ow, h or oh), resample)
+    _check_cancel(cancel)
 
     rot = _s(p, "rotate", "0")
     if rot in ("90", "180", "270"):
@@ -109,10 +121,11 @@ def _apply_geometry(img: Image.Image, p: dict[str, Any]) -> Image.Image:
         img = ImageOps.mirror(img)
     if _b(p, "vflip"):
         img = ImageOps.flip(img)
+    _check_cancel(cancel)
     return img
 
 
-def _apply_adjustments(img: Image.Image, p: dict[str, Any]) -> Image.Image:
+def _apply_adjustments(img: Image.Image, p: dict[str, Any], cancel: Any = None) -> Image.Image:
     if _b(p, "grayscale"):
         img = ImageOps.grayscale(img).convert("RGB") if img.mode != "L" else img
 
@@ -126,10 +139,12 @@ def _apply_adjustments(img: Image.Image, p: dict[str, Any]) -> Image.Image:
                 img = cls(img).enhance(val)
             except ValueError:
                 pass
+        _check_cancel(cancel)
 
     blur = _f(p, "blur", 0)
     if blur > 0:
         img = img.filter(ImageFilter.GaussianBlur(blur))
+    _check_cancel(cancel)
     return img
 
 
@@ -190,8 +205,12 @@ def _save_options(fmt: str, p: dict[str, Any], img: Image.Image) -> dict[str, An
     return opts
 
 
-def convert_image(src: str, dst: str, params: dict[str, Any]) -> str:
-    """执行一次图片转换，返回输出路径。"""
+def convert_image(src: str, dst: str, params: dict[str, Any],
+                  cancel: Any = None) -> str:
+    """执行一次图片转换，返回输出路径。
+
+    cancel: 可选的 threading.Event；置位后尽快中止处理。
+    """
     if not _b(params, "overwrite", True) and os.path.exists(dst):
         raise FileExistsError(f"目标文件已存在：{dst}")
 
@@ -202,18 +221,19 @@ def convert_image(src: str, dst: str, params: dict[str, Any]) -> str:
     if fmt in ("AVIF", "HEIF") and not HEIF_OK and fmt == "HEIF":
         raise RuntimeError("当前环境缺少 HEIF 支持（pillow-heif 未安装）")
 
+    _check_cancel(cancel)
     with Image.open(src) as im:
         n_frames = getattr(im, "n_frames", 1)
         animated = n_frames > 1 and fmt in ("GIF", "WEBP", "PNG", "TIFF")
 
         if animated:
-            return _convert_animated(im, dst, fmt, params, n_frames)
+            return _convert_animated(im, dst, fmt, params, n_frames, cancel)
 
         img = im.convert(im.mode) if im.mode == "P" and fmt == "GIF" else im.copy()
         img.info = dict(im.info)
 
-    img = _apply_geometry(img, params)
-    img = _apply_adjustments(img, params)
+    img = _apply_geometry(img, params, cancel)
+    img = _apply_adjustments(img, params, cancel)
 
     mode = _s(params, "color_mode")
     if mode:
@@ -230,22 +250,26 @@ def convert_image(src: str, dst: str, params: dict[str, Any]) -> str:
     if fmt == "ICO" and img.mode != "RGBA":
         img = img.convert("RGBA")
 
+    _check_cancel(cancel)
     os.makedirs(os.path.dirname(os.path.abspath(dst)) or ".", exist_ok=True)
     img.save(dst, fmt, **_save_options(fmt, params, img))
     return dst
 
 
 def _convert_animated(im: Image.Image, dst: str, fmt: str,
-                      params: dict[str, Any], n_frames: int) -> str:
+                      params: dict[str, Any], n_frames: int,
+                      cancel: Any = None) -> str:
     """处理 GIF / 动态 WebP / APNG 多帧图。"""
     from PIL import ImageSequence
 
     frames: list[Image.Image] = []
     durations: list[int] = []
-    for frame in ImageSequence.Iterator(im):
+    for i, frame in enumerate(ImageSequence.Iterator(im)):
+        if i % 5 == 0:
+            _check_cancel(cancel)
         f = frame.convert("RGBA")
-        f = _apply_geometry(f, params)
-        f = _apply_adjustments(f, params)
+        f = _apply_geometry(f, params, cancel)
+        f = _apply_adjustments(f, params, cancel)
         if fmt in NO_ALPHA:
             f = _flatten(f, _s(params, "background", "#FFFFFF"))
         frames.append(f)
@@ -256,6 +280,7 @@ def _convert_animated(im: Image.Image, dst: str, fmt: str,
         first = first.convert("P", palette=Image.Palette.ADAPTIVE)
         rest = [f.convert("P", palette=Image.Palette.ADAPTIVE) for f in rest]
 
+    _check_cancel(cancel)
     os.makedirs(os.path.dirname(os.path.abspath(dst)) or ".", exist_ok=True)
     opts = _save_options(fmt, params, first)
     opts.pop("exif", None)

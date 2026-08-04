@@ -1,18 +1,22 @@
-"""MediaForge 启动入口。
+"""MediaForge 入口。
 
-不带参数 → 打开图形界面；带参数 → 走命令行。
+默认启动图形界面（不显示任何命令行窗口）；
+传入 --cli 或设置环境变量 MEDIAFORGE_CLI=1 可切换到命令行批量模式。
 """
 from __future__ import annotations
 
-import multiprocessing
+import os
 import sys
 
 
 def main() -> int:
-    multiprocessing.freeze_support()   # PyInstaller 冻结后必需
-    if len(sys.argv) > 1:
+    if os.environ.get("MEDIAFORGE_CLI") == "1":
         from app.cli import main as cli_main
         return cli_main()
+    if "--cli" in sys.argv:
+        from app.cli import main as cli_main
+        # 剥离 --cli，避免传递给 argparse
+        return cli_main([a for a in sys.argv[1:] if a != "--cli"])
     from app.ui.main_window import run
     return run()
 

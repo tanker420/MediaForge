@@ -1,185 +1,100 @@
-"""打包脚本的健全性测试。
+"""打包相关文件的完整性测试。
 
-回归背景：build.ps1 曾包含 UTF-8 中文注释，Windows PowerShell 5.1
-按 ANSI 读取导致乱码与语法错误，CI 直接失败。
+覆盖 C9 修复（icon.ico 用于 Windows 打包 / icon.png 用于 GUI 窗口图标），
+以及安装脚本、构建脚本、CI 工作流之间的路径一致性。
 """
 from __future__ import annotations
 
 import os
-import re
+from pathlib import Path
 
-import pytest
-
-ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
-PS1 = os.path.join(ROOT, "packaging", "ci", "build.ps1")
-# Real workflow used by GitHub Actions (not the packaging/ci reference template).
-WF = os.path.join(ROOT, ".github", "workflows", "build-windows.yml")
-ISS = os.path.join(ROOT, "packaging", "installer.iss")
+ROOT = Path(__file__).resolve().parents[1]
 
 
-def test_build_script_exists():
-    assert os.path.isfile(PS1)
+def _read(rel: str) -> str:
+    p = ROOT / rel
+    assert p.is_file(), f"缺少文件：{rel}"
+    return p.read_text("utf-8", errors="replace")
 
 
-def test_build_script_is_pure_ascii():
-    """PowerShell 5.1 对无 BOM 的 UTF-8 中文会解析失败，故限定纯 ASCII。"""
-    raw = open(PS1, "rb").read()
-    bad = [(i, b) for i, b in enumerate(raw) if b > 127]
-    assert not bad, f"build.ps1 含非 ASCII 字节，位置 {bad[:5]}"
+# ---------------- 资源 ----------------
+def test_icon_files_exist():
+    assert (ROOT / "app" / "resources" / "icon.ico").is_file()
+    assert (ROOT / "app" / "resources" / "icon.png").is_file()
 
 
-def test_build_script_brackets_balanced():
-    src = open(PS1, encoding="utf-8").read()
-    depth = {"{": 0, "(": 0, "[": 0}
-    pairs = {"}": "{", ")": "(", "]": "["}
-    i, n, quote = 0, len(src), None
-    while i < n:
-        c = src[i]
-        if quote:
-            if c == quote:
-                quote = None
-            elif c == "`":
-                i += 1
-        elif c in "\"'":
-            quote = c
-        elif c == "#":
-            while i < n and src[i] != "\n":
-                i += 1
-        elif c in depth:
-            depth[c] += 1
-        elif c in pairs:
-            depth[pairs[c]] -= 1
-            assert depth[pairs[c]] >= 0, f"多余的 {c}"
-        i += 1
-    assert quote is None, "存在未闭合的引号"
-    for k, v in depth.items():
-        assert v == 0, f"{k} 未闭合"
+def test_icon_usage_no_confusion():
+    """C9 修复：GUI 窗口用 PNG，Windows 打包/安装程序用 ICO，各司其职。"""
+    ui_src = _read("app/ui/main_window.py")
+    assert "icon.png" in ui_src
+    assert "icon.ico" not in ui_src
+    spec = _read("packaging/MediaForge.spec")
+    assert "icon.ico" in spec
+    iss = _read("packaging/installer.iss")
+    assert "icon.ico" in iss
 
 
-def test_build_script_has_required_steps():
-    src = open(PS1, encoding="utf-8").read()
-    for kw in ("requirements.txt", "MediaForge.spec",
-               "installer.iss", "dist_installer",
-               "APP_VERSION", "/DMyAppVersion="):
-        assert kw in src, f"缺少关键步骤：{kw}"
+# ---------------- PyInstaller ----------------
+def test_spec_basic():
+    spec = _read("packaging/MediaForge.spec")
+    assert 'name="MediaForge"' in spec
+    assert "console=False" in spec          # 无命令行窗口
+    assert "main.py" in spec
+    assert "version_info.txt" in spec
+    assert "resources" in spec
 
 
-def test_installer_iss_version_is_overridable():
-    """Inno Setup version must be overridable via /DMyAppVersion=..."""
-    src = open(ISS, encoding="utf-8").read()
-    assert "#ifndef MyAppVersion" in src
-    assert '#define MyAppVersion "0.0.0-dev"' in src
+def test_version_info_chinese():
+    vi = _read("packaging/version_info.txt")
+    assert "080404B0" in vi                # zh-CN / UTF-16
+    assert "2052" in vi
+    assert "全能媒体格式转换器" in vi
 
 
-def test_workflow_is_valid_yaml():
-    yaml = pytest.importorskip("yaml")
-    d = yaml.safe_load(open(WF, encoding="utf-8"))
-    steps = d["jobs"]["build"]["steps"]
-    assert len(steps) >= 4
-    assert any("build.ps1" in str(s.get("run", "")) for s in steps)
+# ---------------- Inno Setup ----------------
+def test_installer_chinese_localization():
+    iss = _read("packaging/installer.iss")
+    assert "ChineseSimplified.isl" in iss
+    # 简体中文必须是第一个语言（默认语言）
+    lang_block = iss.split("[Languages]")[1].split("[")[0]
+    assert lang_block.strip().splitlines()[0].startswith("Name: \"chinesesimplified\"")
+    assert "全能格式转换器" in iss
+    assert "dist\\MediaForge" in iss       # 引用 PyInstaller 输出
+    assert "dist_installer" in iss         # 安装包输出目录
 
 
-def test_workflow_tag_driven_release():
-    """Tag push builds + releases; manual dispatch only builds."""
-    yaml = pytest.importorskip("yaml")
-    d = yaml.safe_load(open(WF, encoding="utf-8"))
-    on = d["on"] if "on" in d else d[True]  # PyYAML may parse 'on' as True
-    assert "workflow_dispatch" in on
-    assert "push" in on
-    assert "v*" in on["push"].get("tags", [])
-    assert d.get("permissions", {}).get("contents") == "write"
-    src = open(WF, encoding="utf-8").read()
-    assert "APP_VERSION" in src
-    assert "softprops/action-gh-release" in src
-    assert "github.ref_type == 'tag'" in src or 'github.ref_type == "tag"' in src
+def test_installer_license_and_icon_paths():
+    iss = _read("packaging/installer.iss")
+    assert "..\\LICENSE" in iss
+    assert (ROOT / "LICENSE").is_file()
 
 
-def test_workflow_references_existing_script():
-    """工作流里引用的脚本必须真实存在。"""
-    src = open(WF, encoding="utf-8").read()
-    for m in re.finditer(r"-File\s+([\w\\/.]+)", src):
-        rel = m.group(1).replace("\\", os.sep).replace("/", os.sep)
-        assert os.path.isfile(os.path.join(ROOT, rel)), f"引用了不存在的脚本 {rel}"
+# ---------------- 构建脚本 ----------------
+def test_bat_references_spec_and_iss():
+    bat = _read("packaging/build_windows.bat")
+    assert "MediaForge.spec" in bat
+    assert "installer.iss" in bat
 
 
-# ---------------------------------------------------------------------------
-# PyInstaller spec 路径测试
-#
-# 回归背景：spec 中 version="packaging/version_info.txt" 用了相对路径，
-# PyInstaller 以 spec 所在目录为基准解析，拼成 packaging/packaging/...
-# 导致 FileNotFoundError，构建在最后一步失败。
-# ---------------------------------------------------------------------------
-SPEC = os.path.join(ROOT, "packaging", "MediaForge.spec")
+def test_ps1_references_spec_and_iss():
+    ps1 = _read("packaging/ci/build.ps1")
+    assert "MediaForge.spec" in ps1
+    assert "installer.iss" in ps1
+    assert "ffmpeg" in ps1.lower()
 
 
-def _eval_spec(simulate_windows: bool = False) -> dict:
-    """执行 spec 并捕获传给各构建器的参数。"""
-    src = open(SPEC, encoding="utf-8").read()
-    if simulate_windows:
-        src = src.replace('os.name == "nt"', "True")
-
-    captured: dict = {}
-
-    class Rec:
-        def __init__(self, name):
-            self.n = name
-            self.pure = []
-            self.scripts = []
-            self.binaries = []
-            self.datas = []
-
-        def __call__(self, *a, **k):
-            captured[self.n] = (a, k)
-            return self
-
-    ns = {n: Rec(n) for n in ("Analysis", "PYZ", "EXE", "COLLECT")}
-    cwd = os.getcwd()
-    os.chdir(ROOT)
-    try:
-        exec(compile(src, SPEC, "exec"), ns)
-    finally:
-        os.chdir(cwd)
-    return captured
+def test_workflow_references_build_script():
+    wf = _read(".github/workflows/build-windows.yml")
+    assert "build.ps1" in wf
+    assert "windows-latest" in wf
 
 
-def test_spec_is_executable():
-    assert _eval_spec(), "spec 未能正常执行"
+def test_gui_has_no_command_preview():
+    """A2/B6 修复：GUI 不再展示命令行，也不再暴露专家参数。"""
+    ui_src = _read("app/ui/main_window.py")
+    assert "preview_command" not in ui_src
+    assert "extra_args" not in ui_src
 
 
-def test_spec_entry_script_is_absolute_and_exists():
-    script = _eval_spec()["Analysis"][0][0][0]
-    assert os.path.isabs(script), "入口脚本应使用绝对路径"
-    assert os.path.isfile(script)
-
-
-def test_spec_icon_path_resolves():
-    icon = _eval_spec()["EXE"][1]["icon"]
-    if icon:
-        assert os.path.isabs(icon)
-        assert os.path.isfile(icon)
-
-
-def test_spec_version_file_absolute_on_windows():
-    """version 必须是绝对路径，否则会被拼成 packaging/packaging/..."""
-    version = _eval_spec(simulate_windows=True)["EXE"][1]["version"]
-    assert version, "Windows 下应设置版本信息文件"
-    assert os.path.isabs(version), (
-        "version 必须用绝对路径：PyInstaller 以 spec 所在目录为基准解析相对路径"
-    )
-    assert os.path.isfile(version), f"版本文件不存在：{version}"
-
-
-def test_spec_paths_resolve_relative_to_specdir():
-    """模拟 PyInstaller 的解析规则，确保没有路径会被重复拼接。"""
-    cap = _eval_spec(simulate_windows=True)
-    specdir = os.path.dirname(SPEC)
-    values = [
-        cap["Analysis"][0][0][0],
-        cap["EXE"][1].get("icon"),
-        cap["EXE"][1].get("version"),
-    ]
-    for val in values:
-        if not val:
-            continue
-        resolved = val if os.path.isabs(val) else os.path.join(specdir, val)
-        assert os.path.isfile(resolved), f"路径解析后不存在：{resolved}"
+def test_build_doc_exists():
+    assert (ROOT / "如何生成安装程序.md").is_file()

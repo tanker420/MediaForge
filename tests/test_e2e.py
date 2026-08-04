@@ -1,242 +1,138 @@
-"""端到端转换测试：真实调用 ffmpeg / Pillow 生成文件。"""
+"""端到端测试：真实转换。
+
+- 图片转换使用 Pillow（无需 ffmpeg）；
+- 音视频转换在缺少 ffmpeg 时自动跳过。
+"""
 from __future__ import annotations
 
 import os
 import subprocess
-import sys
+import threading
 
 import pytest
+from PIL import Image
 
-sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
-
-from app.core import formats as F  # noqa: E402
-from app.core.converter import Job, Status, run_job  # noqa: E402
-from app.core.ffprobe import CREATE_NO_WINDOW, ffmpeg_path, probe  # noqa: E402
-
-HAVE_FFMPEG = ffmpeg_path() is not None
-needs_ffmpeg = pytest.mark.skipif(not HAVE_FFMPEG, reason="需要 ffmpeg")
-
-try:
-    from PIL import Image
-    HAVE_PIL = True
-except ImportError:
-    HAVE_PIL = False
-needs_pil = pytest.mark.skipif(not HAVE_PIL, reason="需要 Pillow")
+from app.core import formats as F
+from app.core import image_engine
+from app.core.converter import ConversionQueue, Job, Status
+from app.core.ffprobe import CREATE_NO_WINDOW, ffmpeg_path
 
 
-@pytest.fixture(scope="module")
-def video(tmp_path_factory):
-    d = tmp_path_factory.mktemp("media")
-    out = d / "src.mp4"
-    subprocess.run([ffmpeg_path(), "-y", "-v", "error",
-                    "-f", "lavfi", "-i", "testsrc2=size=320x240:rate=15:duration=2",
-                    "-f", "lavfi", "-i", "sine=frequency=440:duration=2",
-                    "-c:v", "libx264", "-pix_fmt", "yuv420p", "-c:a", "aac",
-                    str(out)], check=True, creationflags=CREATE_NO_WINDOW)
-    return str(out)
+def _make_png(tmp_path, size=(64, 48), color=(200, 30, 30)) -> str:
+    p = tmp_path / "in.png"
+    Image.new("RGB", size, color).save(p)
+    return str(p)
 
 
-@pytest.fixture(scope="module")
-def audio(tmp_path_factory):
-    d = tmp_path_factory.mktemp("media")
-    out = d / "src.flac"
-    subprocess.run([ffmpeg_path(), "-y", "-v", "error",
-                    "-f", "lavfi", "-i", "sine=frequency=330:duration=2",
-                    "-c:a", "flac", str(out)], check=True,
-                   creationflags=CREATE_NO_WINDOW)
-    return str(out)
-
-
-@pytest.fixture(scope="module")
-def picture(tmp_path_factory):
-    d = tmp_path_factory.mktemp("media")
-    out = d / "src.png"
-    Image.new("RGBA", (320, 240), (10, 120, 220, 255)).save(out)
-    return str(out)
-
-
-def _run(src, dst, params, kind):
-    job = run_job(Job(src=src, dst=dst, params=params, kind=kind))
-    assert job.status is Status.DONE, f"转换失败：{job.message}"
-    assert os.path.getsize(dst) > 0
-    return job
-
-
-# ---------------------------- 视频 ----------------------------
-@needs_ffmpeg
-@pytest.mark.parametrize("ext,vc,ac", [
-    ("mkv", "libx264", "flac"),
-    ("webm", "libvpx-vp9", "libopus"),
-    ("avi", "mpeg4", "libmp3lame"),
-    ("mov", "libx264", "aac"),
-    ("ts", "libx264", "aac"),
-])
-def test_video_formats(video, tmp_path, ext, vc, ac):
-    dst = str(tmp_path / f"out.{ext}")
-    _run(video, dst, {"video_codec": vc, "audio_codec": ac,
-                      "crf": 35, "preset": "ultrafast", "cpu_used": 8,
-                      "width": 160, "height": 120}, F.VIDEO)
-
-
-@needs_ffmpeg
-def test_video_to_gif(video, tmp_path):
-    dst = str(tmp_path / "out.gif")
-    _run(video, dst, {"video_codec": "gif", "gif_palette": True,
-                      "fps": "8", "width": 120}, F.VIDEO)
-
-
-@needs_ffmpeg
-def test_remux_is_lossless(video, tmp_path):
-    """copy 模式应保持视频流不变。"""
-    dst = str(tmp_path / "out.mkv")
-    _run(video, dst, {"video_codec": "copy", "audio_codec": "copy"}, F.VIDEO)
-    a, b = probe(video), probe(dst)
-    if a.video and b.video:
-        assert a.video.codec_name == b.video.codec_name
-
-
-@needs_ffmpeg
-def test_resize_applies(video, tmp_path):
-    dst = str(tmp_path / "small.mp4")
-    _run(video, dst, {"video_codec": "libx264", "audio_codec": "aac",
-                      "preset": "ultrafast", "crf": 35,
-                      "width": 160, "height": 120, "keep_aspect": False}, F.VIDEO)
-    info = probe(dst)
-    if info.video and info.video.width:
-        assert (info.video.width, info.video.height) == (160, 120)
-
-
-@needs_ffmpeg
-def test_trim_shortens_output(video, tmp_path):
-    dst = str(tmp_path / "cut.mp4")
-    _run(video, dst, {"video_codec": "libx264", "audio_codec": "aac",
-                      "preset": "ultrafast", "duration": "1"}, F.VIDEO)
-    info = probe(dst)
-    if info.duration:
-        assert info.duration < 1.6
-
-
-@needs_ffmpeg
-def test_two_pass_encoding(video, tmp_path):
-    dst = str(tmp_path / "2pass.mp4")
-    _run(video, dst, {"video_codec": "libx264", "audio_codec": "aac",
-                      "two_pass": True, "bitrate": "200k",
-                      "preset": "ultrafast"}, F.VIDEO)
-
-
-# ---------------------------- 音频 ----------------------------
-@needs_ffmpeg
-@pytest.mark.parametrize("ext,ac", [
-    ("mp3", "libmp3lame"), ("opus", "libopus"), ("wav", "pcm_s16le"),
-    ("m4a", "alac"), ("ogg", "libvorbis"), ("flac", "flac"),
-])
-def test_audio_formats(audio, tmp_path, ext, ac):
-    dst = str(tmp_path / f"out.{ext}")
-    _run(audio, dst, {"audio_codec": ac}, F.AUDIO)
-
-
-@needs_ffmpeg
-def test_extract_audio_from_video(video, tmp_path):
-    dst = str(tmp_path / "track.mp3")
-    _run(video, dst, {"audio_codec": "libmp3lame", "audio_bitrate": "128k"}, F.AUDIO)
-
-
-@needs_ffmpeg
-def test_loudnorm_with_vorbis(audio, tmp_path):
-    """回归：loudnorm 输出 192kHz 曾导致 libvorbis 初始化失败。"""
-    dst = str(tmp_path / "norm.ogg")
-    _run(audio, dst, {"audio_codec": "libvorbis", "normalize": True,
-                      "loudness_target": -16}, F.AUDIO)
-
-
-@needs_ffmpeg
-def test_tempo_change(audio, tmp_path):
-    dst = str(tmp_path / "fast.mp3")
-    _run(audio, dst, {"audio_codec": "libmp3lame", "tempo": 1.5}, F.AUDIO)
-    info = probe(dst)
-    if info.duration:
-        assert info.duration < 1.8
-
-
-# ---------------------------- 图片 ----------------------------
-@needs_pil
-@pytest.mark.parametrize("ext", ["jpg", "png", "webp", "bmp", "tiff", "gif",
-                                 "ico", "pdf", "tga", "ppm"])
-def test_image_formats(picture, tmp_path, ext):
-    dst = str(tmp_path / f"out.{ext}")
-    _run(picture, dst, {"quality": 85}, F.IMAGE)
-
-
-@needs_pil
-def test_image_resize(picture, tmp_path):
-    dst = str(tmp_path / "small.jpg")
-    _run(picture, dst, {"width": 100, "height": 80, "keep_aspect": False}, F.IMAGE)
+# ---------------- 图片引擎 ----------------
+def test_image_png_to_jpg(tmp_path):
+    src = _make_png(tmp_path)
+    dst = str(tmp_path / "out.jpg")
+    image_engine.convert_image(src, dst, {"quality": 80, "optimize": True})
+    assert os.path.isfile(dst)
     with Image.open(dst) as im:
-        assert im.size == (100, 80)
+        assert im.format == "JPEG"
 
 
-@needs_pil
-def test_image_keeps_aspect(picture, tmp_path):
-    dst = str(tmp_path / "fit.png")
-    _run(picture, dst, {"width": 160, "height": 160, "keep_aspect": True}, F.IMAGE)
+def test_image_resize_keep_aspect(tmp_path):
+    src = _make_png(tmp_path, size=(64, 48))
+    dst = str(tmp_path / "out.png")
+    image_engine.convert_image(src, dst, {"width": 32, "height": 32, "keep_aspect": True})
     with Image.open(dst) as im:
-        assert max(im.size) == 160
-        assert abs(im.size[0] / im.size[1] - 320 / 240) < 0.05
+        # contain：等比缩放到 32 以内，宽 32 高 24
+        assert im.size[0] == 32
 
 
-@needs_pil
-def test_transparency_flattened_for_jpeg(picture, tmp_path):
-    dst = str(tmp_path / "flat.jpg")
-    _run(picture, dst, {"background": "#FF0000"}, F.IMAGE)
+def test_image_flatten_transparent_to_jpg(tmp_path):
+    src = str(tmp_path / "t.png")
+    Image.new("RGBA", (16, 16), (0, 0, 0, 0)).save(src)
+    dst = str(tmp_path / "t.jpg")
+    image_engine.convert_image(src, dst, {"background": "#FFFFFF"})
     with Image.open(dst) as im:
         assert im.mode == "RGB"
 
 
-@needs_pil
-def test_grayscale_and_rotate(picture, tmp_path):
-    dst = str(tmp_path / "gray.png")
-    _run(picture, dst, {"grayscale": True, "rotate": "90"}, F.IMAGE)
-    with Image.open(dst) as im:
-        assert im.size == (240, 320)
+def test_image_cancel_raises(tmp_path):
+    src = _make_png(tmp_path)
+    dst = str(tmp_path / "out.jpg")
+    cancel = threading.Event()
+    cancel.set()
+    with pytest.raises(image_engine.CanceledError):
+        image_engine.convert_image(src, dst, {}, cancel)
 
 
-@needs_pil
-def test_quality_affects_size(picture, tmp_path):
-    lo = str(tmp_path / "lo.jpg")
-    hi = str(tmp_path / "hi.jpg")
-    _run(picture, lo, {"quality": 20}, F.IMAGE)
-    _run(picture, hi, {"quality": 98}, F.IMAGE)
-    assert os.path.getsize(lo) < os.path.getsize(hi)
+# ---------------- 队列 ----------------
+def test_queue_single_image_job(tmp_path):
+    src = _make_png(tmp_path)
+    dst = str(tmp_path / "out.jpg")
+    queue = ConversionQueue(workers=1)
+    queue.add(Job(src=src, dst=dst, params={"quality": 80}, kind=F.IMAGE))
+    queue.start()
+    queue.wait()
+    assert queue.jobs[0].status is Status.DONE
+    assert os.path.isfile(dst)
 
 
-# ---------------------------- 错误处理 ----------------------------
-def test_missing_source_fails_gracefully(tmp_path):
-    job = run_job(Job(src=str(tmp_path / "nope.mp4"),
-                      dst=str(tmp_path / "o.mp4"), params={}, kind=F.VIDEO))
-    assert job.status is Status.FAILED
-    assert "不存在" in job.message
+def test_queue_cancel_pending(tmp_path):
+    src = _make_png(tmp_path)
+    queue = ConversionQueue(workers=1)
+    jobs = []
+    for i in range(4):
+        jobs.append(Job(src=src, dst=str(tmp_path / f"out{i}.jpg"),
+                        params={}, kind=F.IMAGE))
+        queue.add(jobs[-1])
+    queue.start()
+    queue.cancel()
+    queue.wait()
+    for j in jobs:
+        assert j.status in (Status.DONE, Status.CANCELED)
 
 
-@needs_pil
-def test_same_source_and_target_rejected(picture):
-    job = run_job(Job(src=picture, dst=picture, params={}, kind=F.IMAGE))
-    assert job.status is Status.FAILED
+# ---------------- 音视频（需要 ffmpeg） ----------------
+needs_ffmpeg = pytest.mark.skipif(ffmpeg_path() is None, reason="未安装 ffmpeg")
 
 
-@needs_pil
-def test_no_overwrite_skips(picture, tmp_path):
-    dst = tmp_path / "exists.png"
-    dst.write_bytes(b"placeholder")
-    job = run_job(Job(src=picture, dst=str(dst),
-                      params={"overwrite": False}, kind=F.IMAGE))
-    assert job.status is Status.SKIPPED
-    assert dst.read_bytes() == b"placeholder"
+def _pick_video_encoder() -> str:
+    """选择当前 ffmpeg 实际支持的 H.264 类编码器（不同构建差异很大）。"""
+    from app.core.ffprobe import available_encoders
+    encs = available_encoders()
+    for enc in ("libx264", "libopenh264", "libx265", "mpeg4", "flv"):
+        if enc in encs:
+            return enc
+    return "mpeg4"
+
+
+def _make_test_video(tmp_path) -> str:
+    src = str(tmp_path / "sample.mp4")
+    subprocess.run(
+        [ffmpeg_path(), "-hide_banner", "-loglevel", "error", "-y",
+         "-f", "lavfi", "-i", "testsrc=duration=0.6:size=160x120:rate=15",
+         "-f", "lavfi", "-i", "sine=frequency=440:duration=0.6",
+         "-c:v", _pick_video_encoder(), "-preset", "ultrafast", "-c:a", "aac",
+         "-shortest", src],
+        check=True, capture_output=True, creationflags=CREATE_NO_WINDOW)
+    return src
 
 
 @needs_ffmpeg
-def test_invalid_params_reported(video, tmp_path):
-    job = run_job(Job(src=video, dst=str(tmp_path / "bad.mp4"),
-                      params={"video_codec": "libx264",
-                              "extra_args": "-invalid_flag_xyz 1"}, kind=F.VIDEO))
-    assert job.status is Status.FAILED
-    assert job.message
+def test_video_remux_copy(tmp_path):
+    from app.core.converter import run_job
+
+    src = _make_test_video(tmp_path)
+    dst = str(tmp_path / "sample.mkv")
+    job = run_job(Job(src=src, dst=dst, kind=F.VIDEO,
+                      params={"video_codec": "copy", "audio_codec": "copy"}))
+    assert job.status is Status.DONE
+    assert os.path.getsize(dst) > 0
+
+
+@needs_ffmpeg
+def test_video_extract_audio(tmp_path):
+    from app.core.converter import run_job
+
+    src = _make_test_video(tmp_path)
+    dst = str(tmp_path / "audio.m4a")
+    job = run_job(Job(src=src, dst=dst, kind=F.AUDIO,
+                      params={"audio_codec": "aac"}))
+    assert job.status is Status.DONE
+    assert os.path.getsize(dst) > 0

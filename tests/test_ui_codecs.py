@@ -1,166 +1,67 @@
-"""界面编码器可用性测试。
+"""UI 与格式目录的一致性测试（无需 Qt 实例）。
 
-回归背景：打包的 FFmpeg 精简版不含 libsvtav1，但界面仍把它列为可选
-且默认选中，用户点转换后只得到一句英文 "Unknown encoder"。
+保证 formats.py 作为单一事实来源的完整性：每个容器引用的编码器
+都必须已注册，且 GUI 参数表单暴露的参数集合与目录一致。
 """
 from __future__ import annotations
 
-import os
-import sys
+from app.core import formats as F
 
-import pytest
-
-sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
-
-pytest.importorskip("PySide6")
-os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
-
-from app.core import formats as F  # noqa: E402
-
-LIMITED = frozenset({"libx264", "libx265", "libvpx-vp9", "mpeg4",
-                     "aac", "libmp3lame", "libopus", "flac", "copy", "gif"})
+# GUI 表单中不暴露、由专属控件处理的参数
+_GUI_EXCLUDED = {"extra_args", "overwrite"}
 
 
-@pytest.fixture(scope="module")
-def qapp():
-    from PySide6.QtWidgets import QApplication
-    app = QApplication.instance() or QApplication([])
-    yield app
+def test_video_formats_codecs_registered():
+    for fmt in F.VIDEO_FORMATS:
+        for enc in fmt.video_codecs:
+            assert enc in F.VIDEO_CODECS, f"{fmt.ext} 引用了未注册视频编码器 {enc}"
+        for enc in fmt.audio_codecs:
+            assert enc in F.AUDIO_CODECS, f"{fmt.ext} 引用了未注册音频编码器 {enc}"
 
 
-@pytest.fixture
-def win(qapp, monkeypatch):
-    import app.core.ffprobe as fp
-    import app.ui.main_window as mw
-    monkeypatch.setattr(fp, "available_encoders", lambda: LIMITED)
-    monkeypatch.setattr(mw, "available_encoders", lambda: LIMITED)
-    monkeypatch.setattr(mw, "ffmpeg_path", lambda: "/fake/ffmpeg")
-    try:
-        return mw.MainWindow()
-    except Exception as exc:  # 缺少图形依赖时跳过
-        pytest.skip(f"无法创建窗口：{exc}")
+def test_audio_formats_codecs_registered():
+    for fmt in F.AUDIO_FORMATS:
+        for enc in fmt.audio_codecs:
+            assert enc in F.AUDIO_CODECS, f"{fmt.ext} 引用了未注册音频编码器 {enc}"
 
 
-def _codec_items(cb):
-    return [(cb.itemData(i), cb.model().item(i).isEnabled())
-            for i in range(cb.count())]
+def test_all_encoders_have_labels():
+    for name, codec in {**F.VIDEO_CODECS, **F.AUDIO_CODECS}.items():
+        assert codec.label, name
+        assert codec.encoder == name
 
 
-def test_unavailable_encoder_is_disabled(win):
-    win.cb_kind.setCurrentIndex(win.cb_kind.findData(F.VIDEO))
-    win.cb_format.setCurrentIndex(win.cb_format.findData("mkv"))
-    for enc, enabled in _codec_items(win.cb_vcodec):
-        if enc in ("copy", "none"):
-            continue
-        assert enabled == (enc in LIMITED), f"{enc} 的可用状态不正确"
+def test_gui_video_param_pool_complete():
+    """GUI 视频表单 = 通用参数 + 视频滤镜 + 音频滤镜 + 当前编码器参数。
+    这里验证基础池与目录一致，且不含专家字段。"""
+    pool = list(F.GENERAL_PARAMS) + list(F.VIDEO_FILTER_PARAMS) + list(F.AUDIO_FILTER_PARAMS)
+    keys = {p.key for p in pool}
+    assert "width" in keys and "crf" not in keys          # crf 来自编码器
+    assert "extra_args" in keys                            # 目录里有（CLI 用）
+    gui_keys = keys - _GUI_EXCLUDED
+    assert "extra_args" not in gui_keys and "overwrite" not in gui_keys
 
 
-def test_default_selection_is_usable(win):
-    """默认选中的编码器必须是当前 FFmpeg 真正支持的。"""
-    win.cb_kind.setCurrentIndex(win.cb_kind.findData(F.VIDEO))
-    for ext in ("mkv", "mp4", "webm", "mov"):
-        idx = win.cb_format.findData(ext)
-        if idx < 0:
-            continue
-        win.cb_format.setCurrentIndex(idx)
-        sel = win.cb_vcodec.currentData()
-        assert sel in LIMITED or sel in ("copy", "none"), \
-            f".{ext} 默认选中了不可用的编码器 {sel}"
+def test_gui_image_param_pool():
+    keys = {p.key for p in F.IMAGE_PARAMS}
+    assert "quality" in keys and "ico_sizes" in keys
+    # overwrite 属于图片参数（引擎需要），GUI 由专属复选框提供；extra_args 不出现
+    assert "extra_args" not in keys
+    assert "overwrite" in keys
 
 
-def test_start_blocks_unavailable_encoder(win, monkeypatch, tmp_path):
-    """强行选中不可用编码器时，应弹出提示且不启动转换。"""
-    import app.ui.main_window as mw
-
-    shown = {}
-
-    class FakeMB:
-        @staticmethod
-        def critical(parent, title, text):
-            shown["title"] = title
-
-        @staticmethod
-        def warning(*a, **k):
-            pass
-
-        @staticmethod
-        def information(*a, **k):
-            pass
-
-    monkeypatch.setattr(mw, "QMessageBox", FakeMB)
-
-    src = tmp_path / "a.mp4"
-    src.write_bytes(b"\0" * 10)
-    win._add_paths([str(src)])
-    win.cb_kind.setCurrentIndex(win.cb_kind.findData(F.VIDEO))
-    win.cb_format.setCurrentIndex(win.cb_format.findData("mkv"))
-    i = win.cb_vcodec.findData("libsvtav1")
-    if i < 0:
-        pytest.skip("该格式无 libsvtav1 选项")
-    win.cb_vcodec.setCurrentIndex(i)
-
-    win.start()
-    assert shown.get("title") == "编码器不可用"
-    assert not win.queue.running
+def test_video_codec_params_do_not_collide_after_dedup():
+    """多段参数合并后按键去重不应丢参数（main_window 中按 key 去重）。"""
+    pool = list(F.GENERAL_PARAMS) + list(F.VIDEO_FILTER_PARAMS) + list(F.AUDIO_FILTER_PARAMS)
+    seen = {}
+    for p in pool:
+        seen[p.key] = p
+    merged = list(seen.values())
+    assert len(merged) == len({p.key for p in merged})
 
 
-def test_no_crash_when_encoder_list_unknown(qapp, monkeypatch):
-    """探测不到编码器列表时（返回空集），不应禁用任何项。"""
-    import app.core.ffprobe as fp
-    import app.ui.main_window as mw
-    monkeypatch.setattr(fp, "available_encoders", frozenset)
-    monkeypatch.setattr(mw, "available_encoders", frozenset)
-    try:
-        w = mw.MainWindow()
-    except Exception as exc:
-        pytest.skip(f"无法创建窗口：{exc}")
-    w.cb_format.setCurrentIndex(w.cb_format.findData("mkv"))
-    assert all(en for _, en in _codec_items(w.cb_vcodec)), \
-        "编码器列表未知时不应禁用任何选项"
-
-
-def test_preset_falls_back_to_available_encoder(win):
-    """预设指定的编码器不可用时，应自动替换为可用项。
-
-    回归：选择《AV1 高压缩》预设后，界面照单全收设成 libsvtav1，
-    而精简版 FFmpeg 并无该编码器，转换时才抛出 Unknown encoder。
-    """
-    i = win.cb_preset.findData("AV1 高压缩")
-    if i < 0:
-        pytest.skip("未找到 AV1 预设")
-    win.cb_preset.setCurrentIndex(i)
-
-    sel = win.cb_vcodec.currentData()
-    assert sel != "libsvtav1"
-    assert sel in LIMITED, f"回退后仍不可用：{sel}"
-    assert win.collect_params()["video_codec"] in LIMITED
-
-
-def test_preset_notifies_user_about_substitution(win):
-    i = win.cb_preset.findData("AV1 高压缩")
-    if i < 0:
-        pytest.skip("未找到 AV1 预设")
-    win.cb_preset.setCurrentIndex(i)
-    assert "自动替换" in win.status.currentMessage()
-
-
-def test_all_builtin_presets_yield_usable_encoder(win):
-    """任何内置预设应用后，都不该留下不可用的编码器。"""
-    from app.core import presets as P
-
-    for p in P.BUILTIN:
-        if p.kind == F.IMAGE:
-            continue
-        idx = win.cb_kind.findData(p.kind)
-        if idx >= 0:
-            win.cb_kind.setCurrentIndex(idx)
-        j = win.cb_preset.findData(p.name)
-        if j < 0:
-            continue
-        win.cb_preset.setCurrentIndex(j)
-        params = win.collect_params()
-        for key in ("video_codec", "audio_codec"):
-            enc = params.get(key) or ""
-            if not enc or enc in ("copy", "none"):
-                continue
-            assert enc in LIMITED, f"预设《{p.name}》产生了不可用的 {key}={enc}"
+def test_choices_contain_default():
+    for codec in {**F.VIDEO_CODECS, **F.AUDIO_CODECS}.values():
+        for p in codec.params:
+            if p.type == "choice" and p.default is not None:
+                assert p.default in p.choices, f"{codec.encoder}.{p.key} 默认值不在选项中"

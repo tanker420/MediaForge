@@ -1,737 +1,901 @@
-"""MediaForge 主窗口。"""
+"""主窗口：现代化单窗口媒体转换器界面。
+
+本次重构要点：
+- 去掉命令行预览框与「自定义 ffmpeg 参数」等专家入口，全程图形化操作；
+- 媒体类别（视频/音频/图片）随拖入文件自动切换，无需手动选择；
+- 参数表单完全由 formats.Param 目录驱动，UI 与 CLI 保持单一事实来源；
+- 转换期间锁定所有会改变任务集合/参数的控件，防止误操作；
+- 完成后一键打开输出文件夹，并汇总成功/失败数量。
+"""
 from __future__ import annotations
 
 import os
 import subprocess
 import sys
-from typing import Any
+from pathlib import Path
 
-from PySide6.QtCore import QObject, Qt, QTimer, Signal
-from PySide6.QtGui import QAction, QDesktopServices, QIcon, QKeySequence
-from PySide6.QtCore import QUrl
+from PySide6.QtCore import QObject, QSettings, QRunnable, Qt, QThreadPool, Signal
+from PySide6.QtGui import QAction, QDragEnterEvent, QDropEvent, QIcon
 from PySide6.QtWidgets import (
-    QApplication, QComboBox, QFileDialog, QHBoxLayout, QHeaderView, QLabel,
-    QLineEdit, QMainWindow, QMenu, QMessageBox, QProgressBar, QPushButton,
-    QSpinBox, QSplitter, QStatusBar, QTabWidget, QTableWidget,
-    QTableWidgetItem, QTextEdit, QToolBar, QVBoxLayout, QWidget,
+    QCheckBox,
+    QComboBox,
+    QFileDialog,
+    QFrame,
+    QHBoxLayout,
+    QLabel,
+    QLineEdit,
+    QMainWindow,
+    QMessageBox,
+    QProgressBar,
+    QPushButton,
+    QScrollArea,
+    QSpinBox,
+    QVBoxLayout,
+    QWidget,
 )
 
 from ..core import formats as F
-from ..core import naming, presets
+from ..core import presets as P
 from ..core.converter import ConversionQueue, Job, Status
-from ..core.ffmpeg_builder import preview_command
-from ..core.ffprobe import available_encoders, ffmpeg_path, ffmpeg_version, probe
-from ..core.naming import human_size, human_time
-from .widgets import ParamForm, ScrollGroup
+from ..core.ffprobe import ffmpeg_path, ffmpeg_version, invalidate_caches, probe
+from ..core.naming import build_output_path, collect_files, dedupe, human_size, human_time
+from .theme import DANGER, SUCCESS, TEXT_SUB, WARNING
+from .widgets import FileTable, ParamForm, SegmentedControl
 
-APP_NAME = "MediaForge"
-VERSION = "1.0.0"
+KIND_LABEL = {F.VIDEO: "视频", F.AUDIO: "音频", F.IMAGE: "图片"}
+_KIND_EXTS = {
+    F.VIDEO: F.INPUT_VIDEO_EXT,
+    F.AUDIO: F.INPUT_AUDIO_EXT,
+    F.IMAGE: F.INPUT_IMAGE_EXT,
+}
+NAMED_PATTERNS = (
+    ("{name}", "原文件名"),
+    ("{name}_converted", "原文件名_converted"),
+    ("{name}_{date}", "原文件名_日期"),
+    ("{parent}_{name}", "上级目录_文件名"),
+)
 
-COL_NAME, COL_TYPE, COL_SIZE, COL_TARGET, COL_STATUS, COL_PROGRESS = range(6)
+STATUS_COLORS = {
+    Status.DONE: SUCCESS,
+    Status.FAILED: DANGER,
+    Status.CANCELED: TEXT_SUB,
+    Status.SKIPPED: WARNING,
+}
 
 
-class Bridge(QObject):
-    """把工作线程的回调安全地转发到 GUI 线程。"""
-
+# --------------------------------------------------------------------------
+# 线程桥接：工作线程 → 主线程信号
+# --------------------------------------------------------------------------
+class _Bridge(QObject):
     progress = Signal(object)
     job_done = Signal(object)
     all_done = Signal(object)
 
 
+class _ProbeBridge(QObject):
+    done = Signal(object)
+
+
+class _ProbeTask(QRunnable):
+    """后台探测单个文件的媒体信息，避免阻塞界面。"""
+
+    def __init__(self, path: str, bridge: _ProbeBridge) -> None:
+        super().__init__()
+        self.path = path
+        self.bridge = bridge
+
+    def run(self) -> None:
+        try:
+            info = probe(self.path)
+        except Exception:  # noqa: BLE001
+            info = None
+        self.bridge.done.emit(info)
+
+
+# --------------------------------------------------------------------------
+# 主窗口
+# --------------------------------------------------------------------------
 class MainWindow(QMainWindow):
     def __init__(self) -> None:
         super().__init__()
-        self.setWindowTitle(f"{APP_NAME} {VERSION} — 全能媒体格式转换器")
-        self.resize(1180, 760)
+        self.setWindowTitle("MediaForge 全能媒体格式转换器")
+        self.resize(1180, 780)
         self.setAcceptDrops(True)
 
-        self.queue = ConversionQueue(workers=2)
-        self.bridge = Bridge()
+        self.settings = QSettings("MediaForge", "MediaForge")
+        self.kind = F.VIDEO
+        self.files: list[str] = []                 # 全部已添加文件（跨类别保留）
+        self._extra: dict = {}                     # 表单未覆盖的预设参数
+        self._out_dir: str = self.settings.value("out_dir", "") or ""
+        self._busy = False
+        self._jobs: list[Job] = []
+        self._job_rows: dict[str, int] = {}        # 源路径 -> 表格行号
+        self._last_out_dir = ""
+        self._probe_target = ""
+        self._has_vcodec = False
+        self._has_acodec = False
+
+        self.bridge = _Bridge()
         self.bridge.progress.connect(self._on_progress)
         self.bridge.job_done.connect(self._on_job_done)
         self.bridge.all_done.connect(self._on_all_done)
-        self.queue.on_progress = self.bridge.progress.emit
-        self.queue.on_job_done = self.bridge.job_done.emit
-        self.queue.on_all_done = self.bridge.all_done.emit
+        self.probe_bridge = _ProbeBridge()
+        self.probe_bridge.done.connect(self._on_probe_done)
+        self._pool = QThreadPool(self)
 
-        self._rows: dict[str, int] = {}
         self._build_ui()
-        self._refresh_formats()
-        QTimer.singleShot(300, self._check_ffmpeg)
+        self._connect()
+        self._apply_kind(F.VIDEO)
+        self._rebuild_table()
+        self._refresh_env()
 
-    # ------------------------------------------------------------------
-    # 界面构建
-    # ------------------------------------------------------------------
+    # ================= 界面构建 =================
     def _build_ui(self) -> None:
-        self._build_toolbar()
+        central = QWidget()
+        root = QVBoxLayout(central)
+        root.setContentsMargins(0, 0, 0, 0)
+        root.setSpacing(0)
+        root.addWidget(self._build_header())
+        root.addWidget(self._build_body(), 1)
+        root.addWidget(self._build_footer())
+        self.setCentralWidget(central)
+        self.statusBar().showMessage("就绪", 3000)
 
-        splitter = QSplitter(Qt.Orientation.Horizontal)
-        splitter.addWidget(self._build_left())
-        splitter.addWidget(self._build_right())
-        splitter.setStretchFactor(0, 3)
-        splitter.setStretchFactor(1, 2)
-        self.setCentralWidget(splitter)
+    def _build_header(self) -> QFrame:
+        header = QFrame()
+        header.setObjectName("AppHeader")
+        header.setFixedHeight(64)
+        lay = QHBoxLayout(header)
+        lay.setContentsMargins(18, 8, 18, 8)
+        lay.setSpacing(12)
 
-        self.status = QStatusBar()
-        self.setStatusBar(self.status)
-        self.total_bar = QProgressBar()
-        self.total_bar.setMaximumWidth(220)
-        self.total_bar.setValue(0)
-        self.status.addPermanentWidget(self.total_bar)
-        self.status.showMessage("就绪 — 把文件拖进来即可开始")
+        icon = QLabel()
+        icon.setPixmap(QIcon(self._icon_path("icon.png")).pixmap(36, 36))
+        icon.setFixedSize(36, 36)
 
-    def _build_toolbar(self) -> None:
-        tb = QToolBar("主工具栏")
-        tb.setMovable(False)
-        self.addToolBar(tb)
+        title_box = QVBoxLayout()
+        title_box.setSpacing(0)
+        title = QLabel("MediaForge")
+        title.setObjectName("AppTitle")
+        subtitle = QLabel("全能媒体格式转换器 · 视频 / 音频 / 图片")
+        subtitle.setObjectName("AppSubtitle")
+        title_box.addWidget(title)
+        title_box.addWidget(subtitle)
 
-        act_add = QAction("添加文件", self)
-        act_add.setShortcut(QKeySequence.StandardKey.Open)
-        act_add.triggered.connect(self.add_files)
-        tb.addAction(act_add)
+        self.env_badge = QPushButton("FFmpeg …")
+        self.env_badge.setObjectName("EnvBadge")
+        self.env_badge.setFlat(True)
+        self.env_badge.setCursor(Qt.PointingHandCursor)
 
-        act_dir = QAction("添加文件夹", self)
-        act_dir.triggered.connect(self.add_folder)
-        tb.addAction(act_dir)
+        lay.addWidget(icon)
+        lay.addLayout(title_box)
+        lay.addStretch(1)
+        lay.addWidget(self.env_badge, 0, Qt.AlignVCenter)
+        return header
 
-        act_rm = QAction("移除选中", self)
-        act_rm.setShortcut(QKeySequence.StandardKey.Delete)
-        act_rm.triggered.connect(self.remove_selected)
-        tb.addAction(act_rm)
+    def _build_body(self) -> QWidget:
+        body = QWidget()
+        lay = QVBoxLayout(body)
+        lay.setContentsMargins(16, 14, 16, 14)
+        lay.setSpacing(14)
 
-        act_clear = QAction("清空列表", self)
-        act_clear.triggered.connect(self.clear_list)
-        tb.addAction(act_clear)
+        # 类别分段选择
+        seg_row = QHBoxLayout()
+        seg_row.setSpacing(10)
+        self.seg = SegmentedControl([(F.VIDEO, "视频"), (F.AUDIO, "音频"), (F.IMAGE, "图片")])
+        seg_row.addWidget(self.seg)
+        seg_row.addStretch(1)
+        seg_row.addWidget(self._kind_note())
+        lay.addLayout(seg_row)
 
-        tb.addSeparator()
-        self.act_start = QAction("开始转换", self)
-        self.act_start.triggered.connect(self.start)
-        tb.addAction(self.act_start)
+        # 左：文件列表；右：输出设置
+        split = QHBoxLayout()
+        split.setSpacing(14)
+        split.addWidget(self._build_files_card(), 3)
+        split.addWidget(self._build_settings_card(), 2)
+        lay.addLayout(split, 1)
+        return body
 
-        self.act_cancel = QAction("取消", self)
-        self.act_cancel.triggered.connect(self.cancel)
-        self.act_cancel.setEnabled(False)
-        tb.addAction(self.act_cancel)
+    def _kind_note(self) -> QLabel:
+        note = QLabel("添加文件后自动识别类别")
+        note.setObjectName("AppSubtitle")
+        return note
 
-        tb.addSeparator()
-        act_doctor = QAction("环境检查", self)
-        act_doctor.triggered.connect(self.show_doctor)
-        tb.addAction(act_doctor)
+    def _build_files_card(self) -> QFrame:
+        card = QFrame()
+        card.setObjectName("Card")
+        lay = QVBoxLayout(card)
+        lay.setContentsMargins(16, 14, 16, 14)
+        lay.setSpacing(10)
 
-        act_about = QAction("关于", self)
-        act_about.triggered.connect(self.show_about)
-        tb.addAction(act_about)
+        title_row = QHBoxLayout()
+        title = QLabel("文件列表")
+        title.setObjectName("SectionTitle")
+        self.lbl_count = QLabel("0 个文件")
+        self.lbl_count.setObjectName("AppSubtitle")
+        title_row.addWidget(title)
+        title_row.addSpacing(8)
+        title_row.addWidget(self.lbl_count)
+        title_row.addStretch(1)
 
-    def _build_left(self) -> QWidget:
-        w = QWidget()
-        v = QVBoxLayout(w)
+        self.btn_add = QPushButton("＋ 添加文件")
+        self.btn_add.setObjectName("PrimaryBtn")
+        self.btn_adddir = QPushButton("添加文件夹")
+        self.btn_remove = QPushButton("移除选中")
+        self.btn_clear = QPushButton("清空")
+        for b in (self.btn_adddir, self.btn_remove, self.btn_clear):
+            b.setCursor(Qt.PointingHandCursor)
+        title_row.addWidget(self.btn_add)
+        title_row.addWidget(self.btn_adddir)
+        title_row.addWidget(self.btn_remove)
+        title_row.addWidget(self.btn_clear)
 
-        self.table = QTableWidget(0, 6)
-        self.table.setHorizontalHeaderLabels(
-            ["文件名", "类型", "大小", "输出为", "状态", "进度"])
-        self.table.setSelectionBehavior(QTableWidget.SelectionBehavior.SelectRows)
-        self.table.setEditTriggers(QTableWidget.EditTrigger.NoEditTriggers)
-        self.table.setContextMenuPolicy(Qt.ContextMenuPolicy.CustomContextMenu)
-        self.table.customContextMenuRequested.connect(self._table_menu)
-        self.table.itemSelectionChanged.connect(self._on_row_selected)
-        hh = self.table.horizontalHeader()
-        hh.setSectionResizeMode(COL_NAME, QHeaderView.ResizeMode.Stretch)
-        for c in (COL_TYPE, COL_SIZE, COL_TARGET, COL_STATUS, COL_PROGRESS):
-            hh.setSectionResizeMode(c, QHeaderView.ResizeMode.ResizeToContents)
-        v.addWidget(self.table, 3)
+        self.table = FileTable()
+        self.hint = QLabel("将文件或文件夹拖拽到此处\n也可以点击「＋ 添加文件」选择")
+        self.hint.setObjectName("DropHint")
+        self.hint.setAlignment(Qt.AlignCenter)
 
-        self.log = QTextEdit()
-        self.log.setReadOnly(True)
-        self.log.setPlaceholderText("转换日志与 ffmpeg 输出会显示在这里")
-        self.log.setMaximumHeight(180)
-        v.addWidget(self.log, 1)
-        return w
+        lay.addLayout(title_row)
+        lay.addWidget(self.table, 1)
+        lay.addWidget(self.hint)
+        return card
 
-    def _build_right(self) -> QWidget:
-        w = QWidget()
-        v = QVBoxLayout(w)
+    def _build_settings_card(self) -> QFrame:
+        card = QFrame()
+        card.setObjectName("Card")
+        outer = QVBoxLayout(card)
+        outer.setContentsMargins(0, 0, 0, 0)
 
-        # ---- 输出设置 ----
-        row = QHBoxLayout()
-        row.addWidget(QLabel("媒体类型"))
-        self.cb_kind = QComboBox()
-        self.cb_kind.addItem("视频", F.VIDEO)
-        self.cb_kind.addItem("音频", F.AUDIO)
-        self.cb_kind.addItem("图片", F.IMAGE)
-        self.cb_kind.currentIndexChanged.connect(self._refresh_formats)
-        row.addWidget(self.cb_kind, 1)
+        scroll = QScrollArea()
+        scroll.setWidgetResizable(True)
+        scroll.setFrameShape(QFrame.NoFrame)
+        panel = QWidget()
+        pv = QVBoxLayout(panel)
+        pv.setContentsMargins(16, 14, 16, 16)
+        pv.setSpacing(10)
 
-        row.addWidget(QLabel("输出格式"))
-        self.cb_format = QComboBox()
-        self.cb_format.currentIndexChanged.connect(self._on_format_changed)
-        row.addWidget(self.cb_format, 2)
-        v.addLayout(row)
+        title = QLabel("输出设置")
+        title.setObjectName("SectionTitle")
+        pv.addWidget(title)
 
-        row2 = QHBoxLayout()
-        row2.addWidget(QLabel("预设"))
+        # 预设
+        pv.addWidget(self._field_label("预设（一键套用常用参数）"))
         self.cb_preset = QComboBox()
-        self.cb_preset.currentIndexChanged.connect(self._apply_preset)
-        row2.addWidget(self.cb_preset, 3)
-        btn_save = QPushButton("保存为预设")
-        btn_save.clicked.connect(self.save_preset)
-        row2.addWidget(btn_save)
-        v.addLayout(row2)
+        pv.addWidget(self.cb_preset)
 
-        row3 = QHBoxLayout()
-        row3.addWidget(QLabel("视频编码"))
+        # 输出格式
+        pv.addWidget(self._field_label("输出格式"))
+        self.cb_fmt = QComboBox()
+        pv.addWidget(self.cb_fmt)
+
+        # 编码器（视频/音频）
+        self.vcodec_label = self._field_label("视频编码器")
         self.cb_vcodec = QComboBox()
-        self.cb_vcodec.currentIndexChanged.connect(self._on_codec_changed)
-        row3.addWidget(self.cb_vcodec, 1)
-        row3.addWidget(QLabel("音频编码"))
+        pv.addWidget(self.vcodec_label)
+        pv.addWidget(self.cb_vcodec)
+
+        self.acodec_label = self._field_label("音频编码器")
         self.cb_acodec = QComboBox()
-        self.cb_acodec.currentIndexChanged.connect(self._on_codec_changed)
-        row3.addWidget(self.cb_acodec, 1)
-        v.addLayout(row3)
+        pv.addWidget(self.acodec_label)
+        pv.addWidget(self.cb_acodec)
 
-        # ---- 参数页 ----
-        self.tabs = QTabWidget()
-        self.form_vcodec = ParamForm()
-        self.form_acodec = ParamForm()
-        self.form_vfilter = ParamForm(F.VIDEO_FILTER_PARAMS)
-        self.form_afilter = ParamForm(F.AUDIO_FILTER_PARAMS)
-        self.form_general = ParamForm(F.GENERAL_PARAMS)
-        self.form_image = ParamForm(F.IMAGE_PARAMS)
+        # 参数表单
+        self.form = ParamForm()
+        pv.addWidget(self.form)
 
-        self.page_vcodec = ScrollGroup("视频编码")
-        self.page_vcodec.add_form("视频编码器参数", self.form_vcodec)
-        self.page_vcodec.add_stretch()
-
-        self.page_acodec = ScrollGroup("音频编码")
-        self.page_acodec.add_form("音频编码器参数", self.form_acodec)
-        self.page_acodec.add_stretch()
-
-        self.page_filters = ScrollGroup("处理")
-        self.page_filters.add_form("画面处理", self.form_vfilter)
-        self.page_filters.add_form("声音处理", self.form_afilter)
-        self.page_filters.add_stretch()
-
-        self.page_general = ScrollGroup("通用")
-        self.page_general.add_form("通用与高级选项", self.form_general)
-        self.page_general.add_stretch()
-
-        self.page_image = ScrollGroup("图片")
-        self.page_image.add_form("图片参数", self.form_image)
-        self.page_image.add_stretch()
-
-        self.tabs.addTab(self.page_vcodec, "视频编码")
-        self.tabs.addTab(self.page_acodec, "音频编码")
-        self.tabs.addTab(self.page_filters, "画面 / 声音")
-        self.tabs.addTab(self.page_general, "通用")
-        self.tabs.addTab(self.page_image, "图片")
-        v.addWidget(self.tabs, 1)
-
-        for form in (self.form_vcodec, self.form_acodec, self.form_vfilter,
-                     self.form_afilter, self.form_general, self.form_image):
-            form.changed.connect(self._update_preview)
-
-        # ---- 输出位置 ----
-        row4 = QHBoxLayout()
-        row4.addWidget(QLabel("输出目录"))
+        # 输出位置
+        loc_title = QLabel("输出位置")
+        loc_title.setObjectName("SectionTitle")
+        pv.addSpacing(6)
+        pv.addWidget(loc_title)
+        dir_row = QHBoxLayout()
         self.ed_outdir = QLineEdit()
-        self.ed_outdir.setPlaceholderText("留空 = 与源文件同目录")
-        self.ed_outdir.textChanged.connect(self._refresh_targets)
-        row4.addWidget(self.ed_outdir, 1)
-        btn_browse = QPushButton("浏览…")
-        btn_browse.clicked.connect(self.pick_outdir)
-        row4.addWidget(btn_browse)
-        v.addLayout(row4)
+        self.ed_outdir.setReadOnly(True)
+        self.ed_outdir.setPlaceholderText("与源文件相同目录")
+        self.btn_browse = QPushButton("浏览…")
+        self.btn_resetdir = QPushButton("重置")
+        dir_row.addWidget(self.ed_outdir, 1)
+        dir_row.addWidget(self.btn_browse)
+        dir_row.addWidget(self.btn_resetdir)
+        pv.addLayout(dir_row)
 
-        row5 = QHBoxLayout()
-        row5.addWidget(QLabel("命名模板"))
-        self.ed_pattern = QLineEdit("{name}")
-        self.ed_pattern.setToolTip("可用变量：{name} {ext} {date} {time} {index} {parent}")
-        self.ed_pattern.textChanged.connect(self._refresh_targets)
-        row5.addWidget(self.ed_pattern, 1)
-        row5.addWidget(QLabel("并发"))
+        # 命名规则
+        pv.addWidget(self._field_label("命名规则"))
+        self.cb_pattern = QComboBox()
+        for pattern, label in NAMED_PATTERNS:
+            self.cb_pattern.addItem(label, pattern)
+        saved = self.settings.value("pattern", "{name}")
+        idx = self.cb_pattern.findData(saved)
+        if idx >= 0:
+            self.cb_pattern.setCurrentIndex(idx)
+        pv.addWidget(self.cb_pattern)
+
+        # 覆盖 + 并行
+        opt_row = QHBoxLayout()
+        self.chk_overwrite = QCheckBox("覆盖同名文件")
+        self.chk_overwrite.setChecked(True)
+        opt_row.addWidget(self.chk_overwrite)
+        opt_row.addStretch(1)
+        opt_row.addWidget(QLabel("并行任务"))
         self.sp_workers = QSpinBox()
-        self.sp_workers.setRange(1, 16)
-        self.sp_workers.setValue(2)
-        row5.addWidget(self.sp_workers)
-        v.addLayout(row5)
+        self.sp_workers.setRange(1, 8)
+        self.sp_workers.setValue(int(self.settings.value("workers", 2)))
+        opt_row.addWidget(self.sp_workers)
+        pv.addLayout(opt_row)
 
-        self.ed_preview = QTextEdit()
-        self.ed_preview.setReadOnly(True)
-        self.ed_preview.setMaximumHeight(80)
-        self.ed_preview.setPlaceholderText("此处显示将要执行的 ffmpeg 命令")
-        v.addWidget(self.ed_preview)
-        return w
+        pv.addStretch(1)
+        scroll.setWidget(panel)
+        outer.addWidget(scroll)
+        return card
 
-    # ------------------------------------------------------------------
-    # 格式 / 编码器联动
-    # ------------------------------------------------------------------
-    def _current_kind(self) -> str:
-        return self.cb_kind.currentData()
+    @staticmethod
+    def _field_label(text: str) -> QLabel:
+        label = QLabel(text)
+        label.setObjectName("ParamLabel")
+        return label
 
-    def _refresh_formats(self) -> None:
-        kind = self._current_kind()
-        self.cb_format.blockSignals(True)
-        self.cb_format.clear()
-        for f in F.formats_for(kind):
-            self.cb_format.addItem(f".{f.ext} — {f.label}", f.ext)
-        self.cb_format.blockSignals(False)
+    def _build_footer(self) -> QFrame:
+        bar = QFrame()
+        bar.setObjectName("FooterBar")
+        bar.setFixedHeight(64)
+        lay = QHBoxLayout(bar)
+        lay.setContentsMargins(18, 10, 18, 10)
+        lay.setSpacing(12)
 
+        self.progress = QProgressBar()
+        self.progress.setRange(0, 100)
+        self.progress.setValue(0)
+        lay.addWidget(self.progress, 1)
+
+        self.lbl_status = QLabel("就绪")
+        self.lbl_status.setObjectName("StatusLabel")
+        self.lbl_status.setMinimumWidth(160)
+        lay.addWidget(self.lbl_status)
+
+        self.btn_open = QPushButton("打开输出文件夹")
+        self.btn_open.setEnabled(False)
+        self.btn_cancel = QPushButton("取消")
+        self.btn_cancel.setEnabled(False)
+        self.btn_start = QPushButton("开始转换")
+        self.btn_start.setObjectName("PrimaryBtn")
+        for b in (self.btn_open, self.btn_cancel, self.btn_start):
+            b.setCursor(Qt.PointingHandCursor)
+        lay.addWidget(self.btn_open)
+        lay.addWidget(self.btn_cancel)
+        lay.addWidget(self.btn_start)
+        return bar
+
+    # ================= 信号连接 =================
+    def _connect(self) -> None:
+        self.seg.changed.connect(self._on_kind_changed)
+        self.table.files_dropped.connect(self.add_files)
+        self.table.itemSelectionChanged.connect(self._on_selection)
+        self.btn_add.clicked.connect(self._pick_files)
+        self.btn_adddir.clicked.connect(self._pick_folder)
+        self.btn_remove.clicked.connect(self._remove_selected)
+        self.btn_clear.clicked.connect(self._clear_files)
+        self.btn_start.clicked.connect(self._start)
+        self.btn_cancel.clicked.connect(self._cancel)
+        self.btn_open.clicked.connect(self.open_output_folder)
+        self.env_badge.clicked.connect(self._rescan_ffmpeg)
+        self.btn_browse.clicked.connect(self._browse_outdir)
+        self.btn_resetdir.clicked.connect(self._reset_outdir)
+
+        self.cb_fmt.currentIndexChanged.connect(self._on_fmt_changed)
+        self.cb_vcodec.currentIndexChanged.connect(self._on_codec_changed)
+        self.cb_acodec.currentIndexChanged.connect(self._on_codec_changed)
+        self.cb_preset.currentIndexChanged.connect(self._on_preset)
+
+        self.chk_overwrite.toggled.connect(
+            lambda v: self.settings.setValue("overwrite", v))
+        self.chk_overwrite.setChecked(
+            self.settings.value("overwrite", True, type=bool))
+        self.sp_workers.valueChanged.connect(
+            lambda v: self.settings.setValue("workers", v))
+        self.cb_pattern.currentIndexChanged.connect(
+            lambda: self.settings.setValue("pattern", self.cb_pattern.currentData()))
+
+        # 快捷键：Delete 移除选中
+        act = QAction(self)
+        act.setShortcut(Qt.Key_Delete)
+        act.triggered.connect(self._remove_selected)
+        self.addAction(act)
+
+    # ================= 类别与格式 =================
+    @property
+    def out_ext(self) -> str:
+        return self.cb_fmt.currentData() or ""
+
+    def _on_kind_changed(self, kind: str) -> None:
+        if kind == self.kind:
+            return
+        self._apply_kind(kind)
+        self._rebuild_table()
+
+    def _apply_kind(self, kind: str) -> None:
+        self.kind = kind
+        self._extra = {}
+
+        # 预设
         self.cb_preset.blockSignals(True)
         self.cb_preset.clear()
-        self.cb_preset.addItem("（不使用预设）", None)
-        for p in presets.all_presets(kind):
-            self.cb_preset.addItem(p.name, p.name)
+        self.cb_preset.addItem("自定义…", None)
+        for p in P.all_presets(kind):
+            self.cb_preset.addItem(p.name, p)
         self.cb_preset.blockSignals(False)
 
-        self.tabs.setTabVisible(0, kind == F.VIDEO)
-        self.tabs.setTabVisible(1, kind in (F.VIDEO, F.AUDIO))
-        self.tabs.setTabVisible(2, kind in (F.VIDEO, F.AUDIO))
-        self.tabs.setTabVisible(3, kind in (F.VIDEO, F.AUDIO))
-        self.tabs.setTabVisible(4, kind == F.IMAGE)
-        if kind == F.IMAGE:
-            self.tabs.setCurrentIndex(4)
-        else:
-            self.tabs.setCurrentIndex(0 if kind == F.VIDEO else 1)
+        # 输出格式
+        self.cb_fmt.blockSignals(True)
+        self.cb_fmt.clear()
+        for f in F.formats_for(kind):
+            text = f.label if f.ext == f.label.split(" ")[0] else f.label
+            self.cb_fmt.addItem(f"{text}  (.{f.ext})", f.ext)
+        self.cb_fmt.blockSignals(False)
 
-        self._on_format_changed()
+        self._sync_codec_combos()
+        self._rebuild_form()
 
-    def _on_format_changed(self) -> None:
-        ext = self.cb_format.currentData()
-        kind = self._current_kind()
+    def _sync_codec_combos(self) -> None:
+        kind, ext = self.kind, self.out_ext
         fmt = F.find_format(ext, kind) if ext else None
-        avail = available_encoders()
 
-        def fill(cb: QComboBox, codecs: tuple[str, ...], table: dict) -> None:
-            cb.blockSignals(True)
-            cb.clear()
-            first_usable = -1
-            for c in codecs:
-                info = table.get(c)
-                label = info.label if info else c
-                usable = (c in ("copy", "none")) or (not avail) or (c in avail)
-                if not usable:
-                    label += "（当前 FFmpeg 不支持）"
-                cb.addItem(label, c)
-                idx = cb.count() - 1
-                if not usable:
-                    # 真正禁用该项，避免用户选到跑不了的编码器
-                    item = cb.model().item(idx)
-                    if item is not None:
-                        item.setEnabled(False)
-                elif first_usable < 0:
-                    first_usable = idx
-            # 默认选中第一个「可用」的编码器，而不是列表里的第一项
-            if first_usable >= 0:
-                cb.setCurrentIndex(first_usable)
-            cb.setEnabled(cb.count() > 0)
-            cb.blockSignals(False)
+        if kind == F.VIDEO and fmt:
+            self._has_vcodec = True
+            self._has_acodec = bool(fmt.audio_codecs)
+        elif kind == F.AUDIO and fmt:
+            self._has_vcodec = False
+            self._has_acodec = bool(fmt.audio_codecs)
+        else:
+            self._has_vcodec = False
+            self._has_acodec = False
 
-        if fmt:
-            fill(self.cb_vcodec, fmt.video_codecs, F.VIDEO_CODECS)
-            fill(self.cb_acodec, fmt.audio_codecs + (("none",) if fmt.audio_codecs else ()),
-                 F.AUDIO_CODECS)
-        self._on_codec_changed()
-        self._refresh_targets()
+        self.vcodec_label.setVisible(self._has_vcodec)
+        self.cb_vcodec.setVisible(self._has_vcodec)
+        self.acodec_label.setVisible(self._has_acodec)
+        self.cb_acodec.setVisible(self._has_acodec)
+
+        for combo, pool, codec_map, has in (
+            (self.cb_vcodec, fmt.video_codecs if fmt else (), F.VIDEO_CODECS, self._has_vcodec),
+            (self.cb_acodec, fmt.audio_codecs if fmt else (), F.AUDIO_CODECS, self._has_acodec),
+        ):
+            combo.blockSignals(True)
+            combo.clear()
+            if has:
+                for enc in pool:
+                    codec = codec_map.get(enc)
+                    text = codec.label if codec else enc
+                    if ffmpeg_path() and enc != "copy" and enc not in _available_encs():
+                        text += "（未安装）"
+                    combo.addItem(text, enc)
+            combo.blockSignals(False)
+
+    def _rebuild_form(self) -> None:
+        self.form.set_params(self._form_params())
+        self.form.set_values(self._extra)
+
+    def _form_params(self) -> list[F.Param]:
+        if self.kind == F.IMAGE:
+            return list(F.IMAGE_PARAMS)
+        params: list[F.Param] = (list(F.GENERAL_PARAMS)
+                                 + list(F.VIDEO_FILTER_PARAMS)
+                                 + list(F.AUDIO_FILTER_PARAMS))
+        if self._has_vcodec:
+            params += list(F.codec_params(self.cb_vcodec.currentData() or ""))
+        if self._has_acodec:
+            params += list(F.codec_params(self.cb_acodec.currentData() or ""))
+        seen: dict[str, F.Param] = {}
+        for p in params:
+            seen[p.key] = p
+        return list(seen.values())
+
+    def _on_fmt_changed(self) -> None:
+        self._sync_codec_combos()
+        self._extra = {}
+        self._rebuild_form()
+        self._update_rows_ext()
 
     def _on_codec_changed(self) -> None:
-        v = self.cb_vcodec.currentData()
-        a = self.cb_acodec.currentData()
-        self.form_vcodec.set_params(F.codec_params(v) if v else ())
-        self.form_acodec.set_params(F.codec_params(a) if a else ())
-        self._update_preview()
+        self._extra = {}
+        self._rebuild_form()
 
-    def _apply_preset(self) -> None:
-        name = self.cb_preset.currentData()
-        if not name:
+    def _on_preset(self, index: int) -> None:
+        preset = self.cb_preset.itemData(index)
+        if preset is None:
             return
-        p = presets.find_preset(name)
-        if not p:
+        if preset.kind != self.kind:
+            self._flash("该预设不适用于当前类别，已忽略")
+            self.cb_preset.setCurrentIndex(0)
             return
-        idx = self.cb_format.findData(p.ext)
+        idx = self.cb_fmt.findData(preset.ext)
         if idx >= 0:
-            self.cb_format.setCurrentIndex(idx)
-        # 预设可能指定当前 FFmpeg 不支持的编码器（如精简版缺 libsvtav1），
-        # 此时自动回退到列表中第一个可用项，避免转换时才报错。
-        avail = available_encoders()
-        fallbacks: list[str] = []
+            self.cb_fmt.setCurrentIndex(idx)
+        if self._has_vcodec:
+            i = self.cb_vcodec.findData(preset.params.get("video_codec", ""))
+            if i >= 0:
+                self.cb_vcodec.setCurrentIndex(i)
+        if self._has_acodec:
+            i = self.cb_acodec.findData(preset.params.get("audio_codec", ""))
+            if i >= 0:
+                self.cb_acodec.setCurrentIndex(i)
+        self._extra = {k: v for k, v in preset.params.items()
+                       if k not in ("video_codec", "audio_codec")}
+        self._rebuild_form()
+        self._flash(f"已应用预设「{preset.name}」，可继续微调参数")
 
-        def pick(cb: QComboBox, want: str, table: dict) -> None:
-            if not want:
-                return
-            i = cb.findData(want)
-            usable = (want in ("copy", "none")) or (not avail) or (want in avail)
-            if i >= 0 and usable:
-                cb.setCurrentIndex(i)
-                return
-            for j in range(cb.count()):
-                item = cb.model().item(j)
-                if item is not None and item.isEnabled():
-                    cb.setCurrentIndex(j)
-                    info = table.get(want)
-                    fallbacks.append(f"{info.label if info else want} → {cb.currentText()}")
-                    return
+    # ================= 文件管理 =================
+    def _visible_files(self) -> list[str]:
+        pool = _KIND_EXTS[self.kind]
+        return [f for f in self.files if f.rsplit(".", 1)[-1].lower() in pool]
 
-        pick(self.cb_vcodec, p.params.get("video_codec", ""), F.VIDEO_CODECS)
-        pick(self.cb_acodec, p.params.get("audio_codec", ""), F.AUDIO_CODECS)
+    def add_files(self, paths: list[str]) -> None:
+        files: list[str] = []
+        dirs: list[str] = []
+        for p in paths:
+            if os.path.isfile(p):
+                files.append(os.path.abspath(p))
+            elif os.path.isdir(p):
+                dirs.append(p)
+        if dirs:
+            files += collect_files(dirs, recursive=True)
 
-        for form in (self.form_vcodec, self.form_acodec, self.form_vfilter,
-                     self.form_afilter, self.form_general, self.form_image):
-            form.set_values(p.params)
+        # 先按真实类别过滤，确定首个文件所属类别
+        valid = [f for f in files if any(
+            f.rsplit(".", 1)[-1].lower() in pool for pool in _KIND_EXTS.values())]
+        if not valid:
+            self._flash("没有找到可转换的媒体文件")
+            return
 
-        if fallbacks:
-            self.status.showMessage(
-                f"已应用预设：{p.name}（当前 FFmpeg 不支持部分编码器，已自动替换："
-                + "；".join(fallbacks) + "）", 12000)
-            self.log.append(f"[提示] 预设「{p.name}」中的编码器不可用，已自动替换："
-                            + "；".join(fallbacks))
+        # 类别自动切换：以第一个文件为准
+        first_kind = F.detect_kind(valid[0])
+        if first_kind != self.kind:
+            self._apply_kind(first_kind)
+            self.seg.set_value(first_kind)
+            self._rebuild_table()
+
+        pool = _KIND_EXTS[self.kind]
+        matched = [f for f in valid if f.rsplit(".", 1)[-1].lower() in pool]
+        existing = set(self.files)
+        new = [f for f in matched if f not in existing]
+        skipped = len(matched) - len(new)
+        self.files.extend(new)
+        self._rebuild_table()
+
+        if new:
+            self._flash(f"已添加 {len(new)} 个文件" +
+                        (f"，忽略 {skipped} 个不匹配的文件" if skipped else ""))
         else:
-            self.status.showMessage(f"已应用预设：{p.name}", 4000)
+            self._flash("所选文件已在列表中或与当前类别不匹配")
 
-    # ------------------------------------------------------------------
-    # 参数收集
-    # ------------------------------------------------------------------
-    def collect_params(self) -> dict[str, Any]:
-        kind = self._current_kind()
-        params: dict[str, Any] = {}
-        if kind == F.IMAGE:
-            params.update(self.form_image.values())
-        else:
-            params.update(self.form_general.values())
-            params.update(self.form_vfilter.values())
-            params.update(self.form_afilter.values())
-            params.update(self.form_vcodec.values())
-            params.update(self.form_acodec.values())
-            params["video_codec"] = self.cb_vcodec.currentData() or ""
-            params["audio_codec"] = self.cb_acodec.currentData() or ""
-        return params
-
-    def _update_preview(self) -> None:
-        ext = self.cb_format.currentData()
-        if not ext:
-            return
-        src = "输入文件." + ("mp4" if self._current_kind() != F.IMAGE else "png")
-        rows = self.table.selectionModel().selectedRows() if self.table.selectionModel() else []
-        if rows:
-            item = self.table.item(rows[0].row(), COL_NAME)
-            if item:
-                src = item.data(Qt.ItemDataRole.UserRole) or src
-        dst = naming.build_output_path(src, self.ed_outdir.text(), ext,
-                                       self.ed_pattern.text() or "{name}")
-        if self._current_kind() == F.IMAGE:
-            self.ed_preview.setPlainText(
-                "图片转换由内置 Pillow 引擎处理，参数：\n" +
-                ", ".join(f"{k}={v}" for k, v in self.collect_params().items()
-                          if v not in ("", 0, None, False)))
-        else:
-            self.ed_preview.setPlainText(preview_command(src, dst, self.collect_params()))
-
-    # ------------------------------------------------------------------
-    # 文件列表
-    # ------------------------------------------------------------------
-    def add_files(self) -> None:
-        files, _ = QFileDialog.getOpenFileNames(self, "选择要转换的文件", "",
-                                                "所有媒体文件 (*.*)")
-        if files:
-            self._add_paths(files)
-
-    def add_folder(self) -> None:
-        d = QFileDialog.getExistingDirectory(self, "选择文件夹")
-        if d:
-            self._add_paths([d])
-
-    def _add_paths(self, paths: list[str]) -> None:
-        allowed = tuple(sorted(set(F.INPUT_VIDEO_EXT + F.INPUT_AUDIO_EXT + F.INPUT_IMAGE_EXT)))
-        files = naming.collect_files(paths, True, allowed)
-        added = 0
-        existing = {self.table.item(r, COL_NAME).data(Qt.ItemDataRole.UserRole)
-                    for r in range(self.table.rowCount())}
-        for f in files:
-            if f in existing:
-                continue
-            self._add_row(f)
-            added += 1
-        if added:
-            self.status.showMessage(f"已添加 {added} 个文件，共 {self.table.rowCount()} 个", 5000)
-            self._refresh_targets()
-
-    def _add_row(self, path: str) -> None:
-        r = self.table.rowCount()
-        self.table.insertRow(r)
-        kind = F.detect_kind(path)
-        name_item = QTableWidgetItem(os.path.basename(path))
-        name_item.setData(Qt.ItemDataRole.UserRole, path)
-        name_item.setToolTip(path)
-        self.table.setItem(r, COL_NAME, name_item)
-        self.table.setItem(r, COL_TYPE, QTableWidgetItem(
-            {"video": "视频", "audio": "音频", "image": "图片"}.get(kind, kind)))
-        try:
-            size = human_size(os.path.getsize(path))
-        except OSError:
-            size = "?"
-        self.table.setItem(r, COL_SIZE, QTableWidgetItem(size))
-        self.table.setItem(r, COL_TARGET, QTableWidgetItem(""))
-        self.table.setItem(r, COL_STATUS, QTableWidgetItem(Status.PENDING.value))
-        bar = QProgressBar()
-        bar.setValue(0)
-        bar.setTextVisible(True)
-        self.table.setCellWidget(r, COL_PROGRESS, bar)
-
-    def _refresh_targets(self) -> None:
-        ext = self.cb_format.currentData()
-        if not ext:
-            return
-        for r in range(self.table.rowCount()):
-            src = self.table.item(r, COL_NAME).data(Qt.ItemDataRole.UserRole)
-            dst = naming.build_output_path(src, self.ed_outdir.text(), ext,
-                                           self.ed_pattern.text() or "{name}",
-                                           index=r + 1)
-            item = self.table.item(r, COL_TARGET)
-            item.setText(os.path.basename(dst))
-            item.setToolTip(dst)
-        self._update_preview()
-
-    def remove_selected(self) -> None:
-        rows = sorted({i.row() for i in self.table.selectedIndexes()}, reverse=True)
-        for r in rows:
-            self.table.removeRow(r)
-        self._refresh_targets()
-
-    def clear_list(self) -> None:
-        self.table.setRowCount(0)
-        self._rows.clear()
-        self.queue.jobs.clear()
-
-    def _on_row_selected(self) -> None:
-        rows = self.table.selectionModel().selectedRows()
-        if not rows:
-            return
-        path = self.table.item(rows[0].row(), COL_NAME).data(Qt.ItemDataRole.UserRole)
-        kind = F.detect_kind(path)
-        idx = self.cb_kind.findData(kind)
-        self._update_preview()
-        if kind != F.IMAGE:
-            info = probe(path)
-            bits = [f"{os.path.basename(path)}"]
-            if info.duration:
-                bits.append(f"时长 {human_time(info.duration)}")
-            v = info.video
-            if v:
-                bits.append(f"{v.codec_name} {v.width}x{v.height} {v.fps:.2f}fps")
-            a = info.audio
-            if a:
-                bits.append(f"{a.codec_name} {a.sample_rate}Hz {a.channels}ch")
-            self.status.showMessage("   ".join(bits), 8000)
-
-    def _table_menu(self, pos) -> None:
-        menu = QMenu(self)
-        act_open = menu.addAction("打开所在文件夹")
-        act_info = menu.addAction("查看详细信息")
-        act_rm = menu.addAction("从列表移除")
-        act = menu.exec(self.table.viewport().mapToGlobal(pos))
-        rows = self.table.selectionModel().selectedRows()
-        if not rows:
-            return
-        path = self.table.item(rows[0].row(), COL_NAME).data(Qt.ItemDataRole.UserRole)
-        if act == act_open:
-            QDesktopServices.openUrl(QUrl.fromLocalFile(os.path.dirname(path)))
-        elif act == act_info:
-            self._show_info(path)
-        elif act == act_rm:
-            self.remove_selected()
-
-    def _show_info(self, path: str) -> None:
-        info = probe(path)
-        lines = [f"文件：{path}", f"大小：{human_size(info.size)}",
-                 f"容器：{info.format_name or '未知'}",
-                 f"时长：{human_time(info.duration)}"]
-        for s in info.streams:
-            if s.codec_type == "video":
-                lines.append(f"视频流 #{s.index}: {s.codec_name} {s.width}x{s.height} "
-                             f"{s.fps:.3f}fps {s.pix_fmt}")
-            elif s.codec_type == "audio":
-                lines.append(f"音频流 #{s.index}: {s.codec_name} {s.sample_rate}Hz "
-                             f"{s.channels}声道 {s.language}")
-            else:
-                lines.append(f"{s.codec_type} #{s.index}: {s.codec_name}")
-        QMessageBox.information(self, "媒体信息", "\n".join(lines))
-
-    # ---------------- 拖放 ----------------
-    def dragEnterEvent(self, event) -> None:  # noqa: N802
-        if event.mimeData().hasUrls():
-            event.acceptProposedAction()
-
-    def dropEvent(self, event) -> None:  # noqa: N802
-        paths = [u.toLocalFile() for u in event.mimeData().urls() if u.isLocalFile()]
+    def _pick_files(self) -> None:
+        paths, _ = QFileDialog.getOpenFileNames(
+            self, "选择要转换的媒体文件",
+            self.settings.value("last_open_dir", os.path.expanduser("~")),
+            "媒体文件 (*.*)")
         if paths:
-            self._add_paths(paths)
-            event.acceptProposedAction()
+            self.settings.setValue("last_open_dir", os.path.dirname(paths[0]))
+            self.add_files(paths)
 
-    # ------------------------------------------------------------------
-    # 转换流程
-    # ------------------------------------------------------------------
-    def start(self) -> None:
-        if self.table.rowCount() == 0:
-            QMessageBox.warning(self, "没有文件", "请先添加要转换的文件。")
+    def _pick_folder(self) -> None:
+        d = QFileDialog.getExistingDirectory(
+            self, "选择要批量转换的文件夹",
+            self.settings.value("last_open_dir", os.path.expanduser("~")))
+        if d:
+            self.add_files([d])
+
+    def _remove_selected(self) -> None:
+        rows = sorted({i.row() for i in self.table.selectionModel().selectedRows()},
+                      reverse=True)
+        for row in rows:
+            item = self.table.item(row, 0)
+            if item is None:
+                continue
+            path = item.data(Qt.UserRole)
+            if path in self.files:
+                self.files.remove(path)
+        self._rebuild_table()
+
+    def _clear_files(self) -> None:
+        self.files.clear()
+        self._rebuild_table()
+
+    def _rebuild_table(self) -> None:
+        self.table.clear_rows()
+        self._job_rows.clear()
+        visible = self._visible_files()
+        for path in visible:
+            try:
+                size = os.path.getsize(path)
+            except OSError:
+                size = 0
+            row = self.table.add_row(path, size, self.out_ext)
+            self._job_rows[path] = row
+        self.hint.setVisible(not visible)
+        self.lbl_count.setText(f"{len(visible)} 个文件")
+
+    def _update_rows_ext(self) -> None:
+        for path, row in self._job_rows.items():
+            item = self.table.item(row, 2)
+            if item is not None:
+                item.setText(f".{self.out_ext}")
+
+    # ================= 输出设置 =================
+    def _browse_outdir(self) -> None:
+        start = self._out_dir or self.settings.value("last_open_dir", os.path.expanduser("~"))
+        d = QFileDialog.getExistingDirectory(self, "选择输出目录", start)
+        if d:
+            self._set_out_dir(os.path.abspath(d))
+
+    def _set_out_dir(self, d: str) -> None:
+        self._out_dir = d
+        self.ed_outdir.setText(d)
+        self.settings.setValue("out_dir", d)
+
+    def _reset_outdir(self) -> None:
+        self._out_dir = ""
+        self.ed_outdir.clear()
+        self.settings.setValue("out_dir", "")
+
+    # ================= 转换执行 =================
+    def _collect_params(self) -> dict:
+        d = F.default_params_for(self.kind)
+        d.update(self.form.values())
+        d.update(self._extra)
+        if self._has_vcodec:
+            d["video_codec"] = self.cb_vcodec.currentData() or ""
+        if self._has_acodec:
+            d["audio_codec"] = self.cb_acodec.currentData() or ""
+        d["overwrite"] = self.chk_overwrite.isChecked()
+        return d
+
+    def _start(self) -> None:
+        files = self._visible_files()
+        if not files:
+            QMessageBox.information(self, "提示", "请先添加要转换的文件。")
             return
-        ext = self.cb_format.currentData()
-        kind = self._current_kind()
-        if kind != F.IMAGE and not ffmpeg_path():
-            QMessageBox.critical(self, "缺少 FFmpeg",
-                                 "未找到 ffmpeg，无法转换音视频。\n"
-                                 "请安装 ffmpeg 并加入 PATH，或放入程序 bin 目录。")
+        if self.kind != F.IMAGE and not ffmpeg_path():
+            ret = QMessageBox.warning(
+                self, "缺少 FFmpeg",
+                "未检测到 FFmpeg。\n\n视频 / 音频转换需要 FFmpeg，"
+                "请安装后点击右上角的 FFmpeg 状态标签重新检测。\n\n是否仍要继续？",
+                QMessageBox.Yes | QMessageBox.No, QMessageBox.No)
+            if ret != QMessageBox.Yes:
+                return
+
+        ext = self.out_ext
+        if not ext:
+            QMessageBox.warning(self, "提示", "请先选择输出格式。")
             return
 
-        params = self.collect_params()
-
-        # 提前拦截当前 FFmpeg 不支持的编码器，给出可读提示
-        if kind != F.IMAGE:
-            avail = available_encoders()
-            if avail:
-                for key, table in (("video_codec", F.VIDEO_CODECS),
-                                   ("audio_codec", F.AUDIO_CODECS)):
-                    enc = params.get(key) or ""
-                    if enc and enc not in ("copy", "none") and enc not in avail:
-                        info = table.get(enc)
-                        QMessageBox.critical(
-                            self, "编码器不可用",
-                            f"当前 FFmpeg 不支持编码器 {info.label if info else enc}"
-                            f"（{enc}），无法转换。\n\n"
-                            "请在上方下拉框中改选其它编码器"
-                            "（灰色项表示不可用），或更换功能更完整的 FFmpeg。")
-                        return
-
-        self.queue = ConversionQueue(workers=self.sp_workers.value())
-        self.queue.on_progress = self.bridge.progress.emit
-        self.queue.on_job_done = self.bridge.job_done.emit
-        self.queue.on_all_done = self.bridge.all_done.emit
-        self._rows.clear()
-
+        params = self._collect_params()
+        overwrite = self.chk_overwrite.isChecked()
         taken: set[str] = set()
-        for r in range(self.table.rowCount()):
-            src = self.table.item(r, COL_NAME).data(Qt.ItemDataRole.UserRole)
-            dst = naming.build_output_path(src, self.ed_outdir.text(), ext,
-                                           self.ed_pattern.text() or "{name}",
-                                           params.get("overwrite", True), r + 1)
-            # 不同来源可能生成同名输出（如不同目录的同名文件），去重避免互相覆盖
-            dst = naming.dedupe(dst, taken)
-            job = Job(src=src, dst=dst, params=dict(params), kind=kind)
-            self.queue.add(job)
-            self._rows[job.id] = r
-            self.table.item(r, COL_STATUS).setText(Status.PENDING.value)
-            bar = self.table.cellWidget(r, COL_PROGRESS)
-            if bar:
-                bar.setValue(0)
+        jobs: list[Job] = []
+        for i, src in enumerate(files, 1):
+            out_dir = self._out_dir or os.path.dirname(src)
+            dst = build_output_path(src, out_dir, ext, self.cb_pattern.currentData(),
+                                    overwrite=overwrite, index=i)
+            dst = dedupe(dst, taken)
+            jobs.append(Job(src=src, dst=dst, params=dict(params), kind=self.kind))
 
-        self.log.append(f"=== 开始转换 {len(self.queue.jobs)} 个文件 → .{ext} ===")
-        self.act_start.setEnabled(False)
-        self.act_cancel.setEnabled(True)
-        self.total_bar.setValue(0)
+        self._jobs = jobs
+        self.queue = ConversionQueue(workers=max(1, self.sp_workers.value()))
+        self.queue.on_progress = lambda j: self.bridge.progress.emit(j)
+        self.queue.on_job_done = lambda j: self.bridge.job_done.emit(j)
+        self.queue.on_all_done = lambda js: self.bridge.all_done.emit(js)
+        for j in jobs:
+            self.queue.add(j)
+
+        self._set_busy(True)
+        self.progress.setValue(0)
+        self.lbl_status.setText(f"开始转换 {len(jobs)} 个文件…")
         self.queue.start()
 
-    def cancel(self) -> None:
+    def _cancel(self) -> None:
         self.queue.cancel()
-        self.status.showMessage("正在取消…")
+        self.btn_cancel.setEnabled(False)
+        self.lbl_status.setText("正在取消…")
 
+    def _set_busy(self, busy: bool) -> None:
+        self._busy = busy
+        for w in (self.seg, self.btn_add, self.btn_adddir, self.btn_remove,
+                  self.btn_clear, self.cb_preset, self.cb_fmt, self.cb_vcodec,
+                  self.cb_acodec, self.ed_outdir, self.btn_browse, self.btn_resetdir,
+                  self.cb_pattern, self.chk_overwrite, self.sp_workers):
+            w.setEnabled(not busy)
+        self.form.set_enabled_all(not busy)
+        self.btn_start.setEnabled(not busy)
+        self.btn_cancel.setEnabled(busy)
+
+    # ---------------- 回调（主线程） ----------------
     def _on_progress(self, job: Job) -> None:
-        r = self._rows.get(job.id)
-        if r is None:
-            return
-        bar = self.table.cellWidget(r, COL_PROGRESS)
-        if bar:
-            bar.setValue(int(job.progress * 100))
-        self.table.item(r, COL_STATUS).setText(
-            f"{job.status.value} {job.speed}".strip())
+        row = self._job_rows.get(job.src)
+        if row is not None:
+            self.table.set_progress(row, job.progress * 100)
+        pct = int(job.progress * 100)
+        extra = f"  {job.speed}" if job.speed else ""
+        self.lbl_status.setText(f"转换中：{job.name}  {pct}%{extra}")
 
     def _on_job_done(self, job: Job) -> None:
-        r = self._rows.get(job.id)
-        if r is not None:
-            self.table.item(r, COL_STATUS).setText(job.status.value)
-            bar = self.table.cellWidget(r, COL_PROGRESS)
-            if bar:
-                bar.setValue(100 if job.status is Status.DONE else bar.value())
+        row = self._job_rows.get(job.src)
+        if row is None:
+            return
+        self.table.set_status(row, job.status.value, STATUS_COLORS.get(job.status))
         if job.status is Status.DONE:
-            self.log.append(f"✔ {job.name} → {os.path.basename(job.dst)}  "
-                            f"{human_size(job.out_size)}  用时 {human_time(job.elapsed)}")
-        elif job.status is Status.FAILED:
-            self.log.append(f"✘ {job.name} 失败：{job.message}")
-        done = sum(1 for j in self.queue.jobs
-                   if j.status in (Status.DONE, Status.FAILED, Status.SKIPPED, Status.CANCELED))
-        total = len(self.queue.jobs) or 1
-        self.total_bar.setValue(int(done / total * 100))
+            self.table.set_progress(row, 100)
+        if job.status is Status.FAILED:
+            item = self.table.item(row, 3)
+            if item is not None:
+                item.setToolTip(job.message)
 
     def _on_all_done(self, jobs: list[Job]) -> None:
-        self.act_start.setEnabled(True)
-        self.act_cancel.setEnabled(False)
-        ok = sum(1 for j in jobs if j.status is Status.DONE)
-        failed = sum(1 for j in jobs if j.status is Status.FAILED)
-        self.total_bar.setValue(100)
-        self.log.append(f"=== 全部结束：成功 {ok}，失败 {failed} ===")
-        self.status.showMessage(f"完成！成功 {ok}，失败 {failed}", 10000)
+        self._set_busy(False)
+        done = [j for j in jobs if j.status is Status.DONE]
+        failed = [j for j in jobs if j.status is Status.FAILED]
+        canceled = [j for j in jobs if j.status is Status.CANCELED]
+        skipped = [j for j in jobs if j.status is Status.SKIPPED]
 
-    # ------------------------------------------------------------------
-    # 其它
-    # ------------------------------------------------------------------
-    def pick_outdir(self) -> None:
-        d = QFileDialog.getExistingDirectory(self, "选择输出目录")
-        if d:
-            self.ed_outdir.setText(d)
+        if jobs:
+            self._last_out_dir = self._out_dir or os.path.dirname(jobs[0].dst)
+        self.btn_open.setEnabled(bool(self._last_out_dir))
 
-    def save_preset(self) -> None:
-        from PySide6.QtWidgets import QInputDialog
-        name, ok = QInputDialog.getText(self, "保存预设", "预设名称：")
-        if not ok or not name.strip():
+        if canceled:
+            self.lbl_status.setText(f"已取消：完成 {len(done)} 个")
+            self.progress.setValue(0)
+            self._flash("转换已取消")
             return
-        user = presets.load_user_presets()
-        user = [p for p in user if p.name != name.strip()]
-        user.append(presets.Preset(name.strip(), self._current_kind(),
-                                   self.cb_format.currentData(),
-                                   self.collect_params(), "用户自定义"))
-        presets.save_user_presets(user)
-        self._refresh_formats()
-        self.status.showMessage(f"预设「{name}」已保存", 5000)
+        self.progress.setValue(100)
+        self.lbl_status.setText(f"全部完成：成功 {len(done)} · 失败 {len(failed)} · 跳过 {len(skipped)}")
 
-    def _check_ffmpeg(self) -> None:
-        if not ffmpeg_path():
+        if not failed:
+            QMessageBox.information(
+                self, "转换完成",
+                f"全部处理完成！\n\n成功 {len(done)} 个，跳过 {len(skipped)} 个。")
+        else:
             QMessageBox.warning(
-                self, "未检测到 FFmpeg",
-                "没有找到 ffmpeg，音视频转换将无法使用（图片转换不受影响）。\n\n"
-                "解决办法：安装 FFmpeg 并加入系统 PATH，"
-                "或把 ffmpeg.exe 放到本程序目录下的 bin 文件夹。")
+                self, "转换完成",
+                f"处理结束，有 {len(failed)} 个文件失败：\n\n"
+                + "\n".join(f"· {j.name}：{j.message}" for j in failed[:8])
+                + ("\n…" if len(failed) > 8 else ""))
 
-    def show_doctor(self) -> None:
-        encs = available_encoders()
-        lines = [f"{APP_NAME} {VERSION}",
-                 f"Python: {sys.version.split()[0]}",
-                 f"FFmpeg: {ffmpeg_version()}",
-                 f"FFmpeg 路径: {ffmpeg_path() or '未找到'}",
-                 f"可用编码器: {len(encs)} 个"]
+    def _on_selection(self) -> None:
+        rows = self.table.selectionModel().selectedRows()
+        if not rows:
+            return
+        item = self.table.item(rows[0].row(), 0)
+        if item is None:
+            return
+        path = item.data(Qt.UserRole)
+        if path == self._probe_target:
+            return
+        self._probe_target = path
+        self._pool.start(_ProbeTask(path, self.probe_bridge))
+
+    def _on_probe_done(self, info) -> None:
+        if info is None or getattr(info, "path", None) != self._probe_target:
+            return
+        parts: list[str] = []
+        if info.has_video:
+            v = info.video
+            parts.append(f"{v.width}×{v.height}" if v.width and v.height else v.codec_name)
+            if v.fps:
+                parts.append(f"{v.fps:g} fps")
+        if info.has_audio:
+            a = info.audio
+            parts.append(a.codec_name)
+            if a.sample_rate:
+                parts.append(f"{a.sample_rate / 1000:g} kHz")
+        if info.duration:
+            parts.append(human_time(info.duration))
+        if info.size:
+            parts.append(human_size(info.size))
+        self.statusBar().showMessage("  ".join(parts) if parts else "已读取媒体信息", 8000)
+
+    # ================= 其它 =================
+    def open_output_folder(self) -> None:
+        d = self._last_out_dir or self._out_dir
+        if not d and self._jobs:
+            d = os.path.dirname(self._jobs[0].dst)
+        if not d or not os.path.isdir(d):
+            self._flash("还没有可打开的输出目录")
+            return
         try:
-            from PIL import Image
-            lines.append(f"Pillow: {Image.__version__}")
-        except ImportError:
-            lines.append("Pillow: 未安装")
-        from ..core.image_engine import HEIF_OK
-        lines.append(f"HEIF/AVIF 支持: {'是' if HEIF_OK else '否'}")
-        QMessageBox.information(self, "环境检查", "\n".join(lines))
+            if sys.platform == "win32":
+                os.startfile(d)  # type: ignore[attr-defined]
+            elif sys.platform == "darwin":
+                subprocess.Popen(["open", d])
+            else:
+                subprocess.Popen(["xdg-open", d])
+        except OSError as exc:
+            QMessageBox.warning(self, "无法打开文件夹", str(exc))
 
-    def show_about(self) -> None:
-        QMessageBox.about(
-            self, f"关于 {APP_NAME}",
-            f"<h3>{APP_NAME} {VERSION}</h3>"
-            "<p>全能的视频 / 音频 / 图片格式转换工具，"
-            "支持批量转换与全部编码参数自定义。</p>"
-            "<p>视频音频由 FFmpeg 驱动，图片由 Pillow 驱动。</p>")
+    def _rescan_ffmpeg(self) -> None:
+        global _enc_cache
+        invalidate_caches()
+        _enc_cache = None
+        self._refresh_env()
+        self._sync_codec_combos()
+        self._flash("已重新检测 FFmpeg")
+
+    def _refresh_env(self) -> None:
+        ver = ffmpeg_version()
+        if ver and ver != "未安装":
+            self.env_badge.setText("FFmpeg 已就绪")
+            self.env_badge.setProperty("warn", False)
+            self.env_badge.setToolTip(ver)
+        else:
+            self.env_badge.setText("未检测到 FFmpeg")
+            self.env_badge.setProperty("warn", True)
+            self.env_badge.setToolTip("视频/音频转换需要 FFmpeg，点击重新检测")
+        self.env_badge.style().unpolish(self.env_badge)
+        self.env_badge.style().polish(self.env_badge)
+
+    def _flash(self, text: str, msecs: int = 5000) -> None:
+        self.statusBar().showMessage(text, msecs)
+
+    @staticmethod
+    def _icon_path(name: str) -> str:
+        return str(Path(__file__).resolve().parents[1] / "resources" / name)
+
+    # ---------------- 拖拽（窗口级） ----------------
+    def dragEnterEvent(self, event: QDragEnterEvent) -> None:
+        if event.mimeData().hasUrls():
+            event.acceptProposedAction()
+        else:
+            super().dragEnterEvent(event)
+
+    def dropEvent(self, event: QDropEvent) -> None:
+        paths = [u.toLocalFile() for u in event.mimeData().urls() if u.toLocalFile()]
+        if paths:
+            self.add_files(paths)
+            event.acceptProposedAction()
+        else:
+            super().dropEvent(event)
+
+    def closeEvent(self, event) -> None:
+        if self._busy:
+            ret = QMessageBox.question(
+                self, "确认退出",
+                "有任务正在转换，退出将中断它们。确定要退出吗？",
+                QMessageBox.Yes | QMessageBox.No, QMessageBox.No)
+            if ret != QMessageBox.Yes:
+                event.ignore()
+                return
+        event.accept()
+
+
+_enc_cache: frozenset[str] | None = None
+
+
+def _available_encs() -> frozenset[str]:
+    """当前 ffmpeg 可用编码器（带缓存，切换 ffmpeg 后由 _rescan_ffmpeg 清除）。"""
+    global _enc_cache
+    if _enc_cache is None:
+        from ..core.ffprobe import available_encoders
+        _enc_cache = available_encoders()
+    return _enc_cache
 
 
 def run() -> int:
-    app = QApplication.instance() or QApplication(sys.argv)
-    app.setApplicationName(APP_NAME)
-    icon = os.path.join(os.path.dirname(__file__), "..", "resources", "icon.ico")
-    if os.path.exists(icon):
-        app.setWindowIcon(QIcon(icon))
-    win = MainWindow()
-    win.show()
+    """启动图形界面。"""
+    if sys.platform == "win32":
+        try:
+            import ctypes
+            ctypes.windll.shcore.SetProcessDpiAwareness(1)  # type: ignore[attr-defined]
+        except Exception:  # noqa: BLE001
+            try:
+                import ctypes
+                ctypes.windll.shell32.SetProcessDPIAware()  # type: ignore[attr-defined]
+            except Exception:  # noqa: BLE001
+                pass
+    from PySide6.QtWidgets import QApplication
+
+    from .theme import apply_theme
+
+    app = QApplication(sys.argv)
+    app.setApplicationName("MediaForge")
+    app.setOrganizationName("MediaForge")
+    app.setWindowIcon(QIcon(MainWindow._icon_path("icon.png")))
+    apply_theme(app)
+    window = MainWindow()
+    window.show()
     return app.exec()
-
-
-if __name__ == "__main__":
-    sys.exit(run())

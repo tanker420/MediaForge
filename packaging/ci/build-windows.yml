@@ -1,25 +1,35 @@
-# REFERENCE TEMPLATE ONLY — not used by GitHub Actions.
-# The real workflow lives at: .github/workflows/build-windows.yml
-# Do not copy this file into .github/ without reviewing the full tag-driven
-# release pipeline (version parse, APP_VERSION, SHA256, softprops/action-gh-release).
-#
-# Kept here so older docs/tests that mention packaging/ci/build-windows.yml
-# still find a pointer. Prefer editing .github/workflows/build-windows.yml.
-
-name: Build & Release Windows Installer (template — DO NOT USE)
+# ============================================================
+#  [参考模板] Windows 构建工作流
+#  真正被 GitHub Actions 使用的是仓库根目录的
+#  .github/workflows/build-windows.yml，本文件为模板副本，
+#  供复用到其它仓库时参考。逻辑完全一致：
+#   - windows-latest + Python 3.11
+#   - packaging/ci/build.ps1 完成 ffmpeg 下载、打包、安装包生成
+# ============================================================
+name: Windows Build (模板)
 
 on:
   workflow_dispatch:
+  push:
+    tags: ["v*"]
 
 jobs:
   build:
     runs-on: windows-latest
     steps:
       - uses: actions/checkout@v4
+
       - uses: actions/setup-python@v5
         with:
-          python-version: "3.12"
-      - run: |
-          echo "This is a reference template only."
-          echo "Use .github/workflows/build-windows.yml instead."
-          exit 1
+          python-version: "3.11"
+
+      - name: 构建
+        shell: powershell
+        run: |
+          $ver = (git describe --tags --abbrev=0 2>$null) ?? "1.0.0"
+          powershell -ExecutionPolicy Bypass -File packaging\ci\build.ps1 -Version $ver
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: MediaForge-Setup
+          path: dist_installer/*.exe

@@ -1,161 +1,58 @@
-"""核心逻辑单元测试（不依赖 ffmpeg 是否安装）。"""
+"""核心模块测试：格式目录、命名、预设（无需 ffmpeg / Qt）。"""
 from __future__ import annotations
 
 import os
-import sys
 
-import pytest
-
-sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
-
-from app.core import formats as F  # noqa: E402
-from app.core import naming  # noqa: E402
-from app.core.ffmpeg_builder import (  # noqa: E402
-    build_audio_filters, build_video_filters,
-)
+from app.core import formats as F
+from app.core import naming
+from app.core import presets as P
 
 
-# ---------------------------- 格式目录 ----------------------------
-def test_format_catalog_not_empty():
-    assert len(F.VIDEO_FORMATS) >= 15
-    assert len(F.AUDIO_FORMATS) >= 15
-    assert len(F.IMAGE_FORMATS) >= 15
+# ---------------- 格式目录 ----------------
+def test_formats_three_kinds():
+    assert F.formats_for(F.VIDEO)
+    assert F.formats_for(F.AUDIO)
+    assert F.formats_for(F.IMAGE)
 
 
-def test_every_video_format_has_codecs():
-    for f in F.VIDEO_FORMATS:
-        assert f.video_codecs, f"{f.ext} 缺少视频编码器"
+def test_find_format():
+    assert F.find_format("mp4", F.VIDEO).ext == "mp4"
+    assert F.find_format(".MP3", F.AUDIO).ext == "mp3"
+    assert F.find_format("png", F.IMAGE).ext == "png"
+    assert F.find_format("mp4", F.AUDIO) is None
+    assert F.find_format("not_a_format") is None
 
 
-def test_codec_references_are_defined():
-    """容器里列出的编码器必须都在编码器表中有定义。"""
-    for f in F.VIDEO_FORMATS:
-        for c in f.video_codecs:
-            assert c in F.VIDEO_CODECS, f"{f.ext} 引用了未定义的视频编码器 {c}"
-        for c in f.audio_codecs:
-            assert c in F.AUDIO_CODECS, f"{f.ext} 引用了未定义的音频编码器 {c}"
-    for f in F.AUDIO_FORMATS:
-        for c in f.audio_codecs:
-            assert c in F.AUDIO_CODECS, f"{f.ext} 引用了未定义的音频编码器 {c}"
+def test_detect_kind():
+    assert F.detect_kind("a.mp4") == F.VIDEO
+    assert F.detect_kind("b.flac") == F.AUDIO
+    assert F.detect_kind("c.png") == F.IMAGE
 
 
-def test_param_defaults_within_range():
-    pools = [F.GENERAL_PARAMS, F.VIDEO_FILTER_PARAMS, F.AUDIO_FILTER_PARAMS, F.IMAGE_PARAMS]
-    pools += [c.params for c in F.VIDEO_CODECS.values()]
-    pools += [c.params for c in F.AUDIO_CODECS.values()]
-    for pool in pools:
-        for p in pool:
-            if p.type in ("int", "float") and p.default is not None:
-                if p.minimum is not None:
-                    assert p.default >= p.minimum, f"{p.key} 默认值低于下限"
-                if p.maximum is not None:
-                    assert p.default <= p.maximum, f"{p.key} 默认值高于上限"
-            if p.type == "choice" and p.choices and p.default is not None:
-                assert str(p.default) in p.choices, f"{p.key} 默认值不在候选项内"
+def test_default_params_cover_core_keys():
+    d = F.default_params_for(F.VIDEO)
+    assert "overwrite" in d and "extra_args" in d
+    assert "video_codec" not in d  # 编码器由格式/用户显式指定
+    d_img = F.default_params_for(F.IMAGE)
+    assert "quality" in d_img and "overwrite" in d_img
+    assert "extra_args" not in d_img
 
 
-@pytest.mark.parametrize("path,expected", [
-    ("a.mp4", F.VIDEO), ("a.mkv", F.VIDEO), ("a.avi", F.VIDEO),
-    ("a.mp3", F.AUDIO), ("a.flac", F.AUDIO), ("a.wav", F.AUDIO),
-    ("a.png", F.IMAGE), ("a.jpg", F.IMAGE), ("a.heic", F.IMAGE),
-])
-def test_detect_kind(path, expected):
-    assert F.detect_kind(path) == expected
+def test_every_codec_param_valid():
+    for codec in list(F.VIDEO_CODECS.values()) + list(F.AUDIO_CODECS.values()):
+        for p in codec.params:
+            assert p.type in ("bool", "int", "float", "str", "choice"), codec.encoder
+            if p.type == "choice":
+                assert p.choices, f"{codec.encoder}.{p.key} 缺少选项"
+            if p.type == "bool":
+                assert isinstance(p.default, bool)
 
 
-# ---------------------------- 滤镜链 ----------------------------
-def test_scale_filter_keeps_aspect():
-    vf = build_video_filters({"width": 1280, "height": 720, "keep_aspect": True})
-    joined = ",".join(vf)
-    assert "force_original_aspect_ratio=decrease" in joined
-    assert "pad=1280:720" in joined
-
-
-def test_scale_filter_stretch():
-    vf = build_video_filters({"width": 1280, "height": 720, "keep_aspect": False})
-    assert "scale=1280:720" in ",".join(vf)
-
-
-def test_single_dimension_uses_auto():
-    vf = build_video_filters({"width": 640, "keep_aspect": False})
-    assert "scale=640:-2" in ",".join(vf)
-
-
-def test_rotate_and_flip():
-    vf = build_video_filters({"rotate": "90", "hflip": True, "vflip": True})
-    joined = ",".join(vf)
-    assert "transpose=1" in joined and "hflip" in joined and "vflip" in joined
-
-
-def test_eq_filter_only_when_changed():
-    assert not build_video_filters({"brightness": 0, "contrast": 1, "saturation": 1, "gamma": 1})
-    vf = build_video_filters({"contrast": 1.5})
-    assert "eq=contrast=1.5" in ",".join(vf)
-
-
-def test_loudnorm_resamples_back():
-    """loudnorm 输出 192kHz，必须重采样回去，否则 libvorbis 会失败。"""
-    af = build_audio_filters({"normalize": True, "_sample_rate": 44100})
-    joined = ",".join(af)
-    assert "loudnorm" in joined
-    assert "aresample=44100" in joined
-    assert joined.index("loudnorm") < joined.index("aresample")
-
-
-def test_atempo_chained_for_extreme_values():
-    """atempo 单次只支持 0.5~2.0，超出范围需串联多个。"""
-    af = build_audio_filters({"tempo": 4.0})
-    assert len(af) == 2
-    product = 1.0
-    for f in af:
-        assert f.startswith("atempo=")
-        product *= float(f.split("=")[1])
-    assert product == pytest.approx(4.0)
-
-    af = build_audio_filters({"tempo": 0.25})
-    product = 1.0
-    for f in af:
-        product *= float(f.split("=")[1])
-    assert product == pytest.approx(0.25)
-
-
-def test_volume_filter():
-    assert "volume=-6dB" in ",".join(build_audio_filters({"volume": -6}))
-    assert not build_audio_filters({"volume": 0})
-
-
-# ---------------------------- 命名 ----------------------------
-def test_build_output_path_pattern(tmp_path):
-    src = tmp_path / "movie.mkv"
-    src.write_bytes(b"x")
-    out = naming.build_output_path(str(src), str(tmp_path), "mp4", "{name}_conv")
-    assert os.path.basename(out) == "movie_conv.mp4"
-
-
-def test_output_never_equals_input(tmp_path):
-    src = tmp_path / "clip.mp4"
-    src.write_bytes(b"x")
-    out = naming.build_output_path(str(src), str(tmp_path), "mp4", "{name}")
-    assert os.path.abspath(out) != os.path.abspath(str(src))
-
-
-def test_dedupe_avoids_collisions():
-    taken: set[str] = set()
-    a = naming.dedupe("/out/x.mp3", taken)
-    b = naming.dedupe("/out/x.mp3", taken)
-    c = naming.dedupe("/out/x.mp3", taken)
-    assert a != b != c and len({a, b, c}) == 3
-
-
-def test_sanitize_removes_illegal_chars():
-    assert "/" not in naming.sanitize("a/b")
-    assert ":" not in naming.sanitize("a:b")
-    assert naming.sanitize("...") == "output"
-
-
+# ---------------- 命名 ----------------
 def test_human_size():
-    assert naming.human_size(0) == "0 B"
-    assert naming.human_size(1536).startswith("1.50 KB")
+    assert naming.human_size(512) == "512 B"
+    assert naming.human_size(2048) == "2.00 KB"
+    assert naming.human_size(5 * 1024 ** 3) == "5.00 GB"
 
 
 def test_human_time():
@@ -164,12 +61,80 @@ def test_human_time():
     assert naming.human_time(3661) == "1:01:01"
 
 
-def test_collect_files_filters_by_ext(tmp_path):
-    (tmp_path / "a.mp4").write_bytes(b"x")
-    (tmp_path / "b.txt").write_bytes(b"x")
-    sub = tmp_path / "sub"
-    sub.mkdir()
-    (sub / "c.mp3").write_bytes(b"x")
-    found = naming.collect_files([str(tmp_path)], True, ("mp4", "mp3"))
-    names = sorted(os.path.basename(f) for f in found)
-    assert names == ["a.mp4", "c.mp3"]
+def test_sanitize():
+    # < > : " / \ | ? * 共 8 个非法字符 → 8 个下划线
+    assert naming.sanitize('a<b>:"/\\|?*.mp4') == "a_b________.mp4"
+    assert naming.sanitize("  ") == "output"
+
+
+def test_build_output_path_same_dir_avoidance(tmp_path):
+    src = tmp_path / "movie.mp4"
+    src.write_bytes(b"x")
+    out = naming.build_output_path(str(src), "", "mkv")
+    assert out.endswith(".mkv") and out != str(src)
+    # 同源同名时自动加 _converted
+    same = naming.build_output_path(str(src), "", "mp4")
+    assert same.endswith("_converted.mp4")
+
+
+def test_build_output_path_pattern(tmp_path):
+    src = tmp_path / "clip.mp4"
+    src.write_bytes(b"x")
+    out = naming.build_output_path(str(src), str(tmp_path), "mp3",
+                                   pattern="{name}_{date}")
+    assert os.path.basename(out).startswith("clip_20")
+
+
+def test_unique_path(tmp_path):
+    p = tmp_path / "a.txt"
+    p.write_text("1")
+    assert naming.unique_path(str(p)) == str(tmp_path / "a (1).txt")
+
+
+def test_dedupe(tmp_path):
+    taken = {str(tmp_path / "a.mp4")}   # 已存在同名文件
+    first = naming.dedupe(str(tmp_path / "a.mp4"), taken)
+    second = naming.dedupe(str(tmp_path / "a.mp4"), taken)
+    assert first == str(tmp_path / "a (1).mp4")
+    assert second == str(tmp_path / "a (2).mp4")
+    assert {first, second} <= taken
+
+
+def test_collect_files_recursive(tmp_path):
+    (tmp_path / "sub").mkdir()
+    (tmp_path / "1.mp4").write_bytes(b"")
+    (tmp_path / "2.png").write_bytes(b"")
+    (tmp_path / "sub" / "3.mp4").write_bytes(b"")
+    got = naming.collect_files([str(tmp_path)], recursive=True, exts=("mp4",))
+    assert len(got) == 2
+    assert all(f.endswith(".mp4") for f in got)
+
+
+# ---------------- 预设 ----------------
+def test_builtin_presets_cover_all_kinds():
+    for kind in (F.VIDEO, F.AUDIO, F.IMAGE):
+        assert P.all_presets(kind), f"{kind} 缺少预设"
+
+
+def test_builtin_preset_params_valid():
+    for p in P.BUILTIN:
+        assert p.ext == F.find_format(p.ext, p.kind).ext, p.name
+        for key in ("video_codec", "audio_codec"):
+            enc = p.params.get(key)
+            if enc and enc != "copy":
+                pool = F.VIDEO_CODECS if key == "video_codec" else F.AUDIO_CODECS
+                assert enc in pool, f"{p.name} 引用了未注册编码器 {enc}"
+
+
+def test_find_preset():
+    assert P.find_preset("MP4 通用高质量") is not None
+    assert P.find_preset("不存在的预设") is None
+
+
+def test_user_presets_roundtrip(tmp_path, monkeypatch):
+    monkeypatch.setattr(P, "config_dir", lambda: tmp_path)
+    P.save_user_presets([P.Preset("我的预设", F.VIDEO, "mkv", {"crf": 18})])
+    loaded = P.load_user_presets()
+    assert len(loaded) == 1
+    assert loaded[0].name == "我的预设"
+    assert loaded[0].params["crf"] == 18

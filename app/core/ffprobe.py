@@ -53,6 +53,17 @@ def ffprobe_path() -> str | None:
     return find_tool("ffprobe")
 
 
+def invalidate_caches() -> None:
+    """清除 ffmpeg 探测缓存。
+
+    用户更换/安装了新的 FFmpeg 后调用，让程序重新扫描可执行文件
+    与可用编码器，无需重启。
+    """
+    find_tool.cache_clear()
+    available_encoders.cache_clear()
+    ffmpeg_version.cache_clear()
+
+
 class FFmpegMissing(RuntimeError):
     """未找到 ffmpeg 可执行文件。"""
 

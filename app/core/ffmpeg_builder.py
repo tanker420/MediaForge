@@ -37,6 +37,21 @@ def _b(params: dict[str, Any], key: str, default: bool = False) -> bool:
 # --------------------------------------------------------------------------
 # 滤镜链
 # --------------------------------------------------------------------------
+def _escape_filter_path(p: str) -> str:
+    """转义 filtergraph 中的路径特殊字符。
+
+    字幕文件路径可能包含 : ' [ ] , ; 等字符（如 "C:\videos\[1080p] 片.srt"），
+    这些在 filtergraph 里都有特殊含义，必须转义，否则 subtitles 滤镜解析失败。
+    """
+    return (p.replace("\\", "/")
+             .replace(":", r"\:")
+             .replace("'", r"\'")
+             .replace("[", r"\[")
+             .replace("]", r"\]")
+             .replace(",", r"\,")
+             .replace(";", r"\;"))
+
+
 def build_video_filters(params: dict[str, Any]) -> list[str]:
     chain: list[str] = []
 
@@ -103,7 +118,7 @@ def build_video_filters(params: dict[str, Any]) -> list[str]:
     if params.get("subtitle_mode") == "burn":
         sub = _s(params, "subtitle_file")
         if sub:
-            esc = sub.replace("\\", "/").replace(":", r"\:").replace("'", r"\'")
+            esc = _escape_filter_path(sub)
             chain.append(f"subtitles='{esc}'")
 
     custom = _s(params, "video_filter")
@@ -433,6 +448,12 @@ def build_command(src: str, dst: str, params: dict[str, Any],
         cmd += ["-t", dur]
     elif end:
         cmd += ["-to", end]
+
+    # 注入内部推导参数：媒体总时长（用于音频淡出等依赖时长的滤镜）。
+    # 这样 GUI 预览 / CLI dry-run 生成的命令与实际执行完全一致。
+    if info is not None and info.duration and not params.get("_duration"):
+        params = dict(params)
+        params["_duration"] = info.duration
 
     out_ext = dst.rsplit(".", 1)[-1].lower()
     fmt = F.find_format(out_ext)
