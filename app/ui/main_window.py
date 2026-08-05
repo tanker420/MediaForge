@@ -17,6 +17,7 @@ from pathlib import Path
 from PySide6.QtCore import QObject, QSettings, QRunnable, Qt, QThreadPool, Signal
 from PySide6.QtGui import QAction, QDragEnterEvent, QDropEvent, QIcon, QKeySequence
 from PySide6.QtWidgets import (
+    QApplication,
     QCheckBox,
     QComboBox,
     QFileDialog,
@@ -43,7 +44,8 @@ from ..core import updater
 from ..core.converter import ConversionQueue, Job, Status
 from ..core.ffprobe import ffmpeg_path, ffmpeg_version, invalidate_caches, probe
 from ..core.naming import build_output_path, collect_files, dedupe, human_size, human_time
-from .theme import DANGER, SUCCESS, TEXT_SUB, WARNING
+from .theme import (DANGER, SUCCESS, TEXT_SUB, WARNING, GlassBackdrop,
+                    apply_theme, is_dark)
 from .preset_dialog import PresetManagerDialog
 from .preview import MediaPreview
 from .update_dialog import (
@@ -112,6 +114,7 @@ class MainWindow(QMainWindow):
         super().__init__()
         self.setWindowTitle("MediaForge 全能媒体格式转换器")
         self.resize(1180, 780)
+        self.setMinimumSize(980, 640)
         self.setAcceptDrops(True)
 
         self.settings = QSettings("MediaForge", "MediaForge")
@@ -143,11 +146,13 @@ class MainWindow(QMainWindow):
         self._apply_kind(F.VIDEO)
         self._rebuild_table()
         self._refresh_env()
+        if self.settings.value("ui_dark", False, type=bool):
+            self._set_dark(True, persist=False)
         self._maybe_check_update_on_startup()
 
     # ================= 界面构建 =================
     def _build_ui(self) -> None:
-        central = QWidget()
+        central = GlassBackdrop()
         root = QVBoxLayout(central)
         root.setContentsMargins(0, 0, 0, 0)
         root.setSpacing(0)
@@ -158,16 +163,20 @@ class MainWindow(QMainWindow):
         self.statusBar().showMessage("就绪", 3000)
 
     def _build_header(self) -> QFrame:
+        """macOS 工具栏式头部：左品牌、中分段选择器、右状态与菜单。
+
+        最小化/最大化/关闭保持系统原生标题栏（Windows 位置），此处不自绘。
+        """
         header = QFrame()
         header.setObjectName("AppHeader")
-        header.setFixedHeight(64)
+        header.setFixedHeight(52)
         lay = QHBoxLayout(header)
-        lay.setContentsMargins(18, 8, 18, 8)
-        lay.setSpacing(12)
+        lay.setContentsMargins(16, 6, 12, 6)
+        lay.setSpacing(10)
 
         icon = QLabel()
-        icon.setPixmap(QIcon(self._icon_path("icon.png")).pixmap(36, 36))
-        icon.setFixedSize(36, 36)
+        icon.setPixmap(QIcon(self._icon_path("icon.png")).pixmap(28, 28))
+        icon.setFixedSize(28, 28)
 
         title_box = QVBoxLayout()
         title_box.setSpacing(0)
@@ -177,6 +186,9 @@ class MainWindow(QMainWindow):
         subtitle.setObjectName("AppSubtitle")
         title_box.addWidget(title)
         title_box.addWidget(subtitle)
+
+        # 类别分段选择器：工具栏居中（macOS Finder 式）
+        self.seg = SegmentedControl([(F.VIDEO, "视频"), (F.AUDIO, "音频"), (F.IMAGE, "图片")])
 
         self.env_badge = QPushButton("FFmpeg …")
         self.env_badge.setObjectName("EnvBadge")
@@ -200,31 +212,32 @@ class MainWindow(QMainWindow):
         self.menu.addAction(self.act_log_dir)
         self.menu_btn.setMenu(self.menu)
 
+        self.theme_btn = QToolButton()
+        self.theme_btn.setObjectName("ThemeBtn")
+        self.theme_btn.setCursor(Qt.PointingHandCursor)
+        self.theme_btn.setText("深色")
+        self.theme_btn.setToolTip("切换深色 / 浅色主题")
+
         lay.addWidget(icon)
         lay.addLayout(title_box)
         lay.addStretch(1)
-        lay.addWidget(self.menu_btn, 0, Qt.AlignVCenter)
+        lay.addWidget(self.seg, 0, Qt.AlignVCenter)
+        lay.addStretch(1)
+        lay.addWidget(self.theme_btn, 0, Qt.AlignVCenter)
         lay.addWidget(self.env_badge, 0, Qt.AlignVCenter)
+        lay.addWidget(self.menu_btn, 0, Qt.AlignVCenter)
         return header
 
     def _build_body(self) -> QWidget:
         body = QWidget()
+        body.setObjectName("Body")
         lay = QVBoxLayout(body)
-        lay.setContentsMargins(16, 14, 16, 14)
-        lay.setSpacing(14)
+        lay.setContentsMargins(14, 12, 14, 12)
+        lay.setSpacing(12)
 
-        # 类别分段选择
-        seg_row = QHBoxLayout()
-        seg_row.setSpacing(10)
-        self.seg = SegmentedControl([(F.VIDEO, "视频"), (F.AUDIO, "音频"), (F.IMAGE, "图片")])
-        seg_row.addWidget(self.seg)
-        seg_row.addStretch(1)
-        seg_row.addWidget(self._kind_note())
-        lay.addLayout(seg_row)
-
-        # 左：文件列表；右：输出设置
+        # 左：文件列表；右：输出设置（inspector 风格）
         split = QHBoxLayout()
-        split.setSpacing(14)
+        split.setSpacing(12)
         split.addWidget(self._build_files_card(), 3)
         split.addWidget(self._build_settings_card(), 2)
         lay.addLayout(split, 1)
@@ -250,6 +263,8 @@ class MainWindow(QMainWindow):
         title_row.addWidget(title)
         title_row.addSpacing(8)
         title_row.addWidget(self.lbl_count)
+        title_row.addSpacing(12)
+        title_row.addWidget(self._kind_note())
         title_row.addStretch(1)
 
         self.btn_add = QPushButton("＋ 添加文件")
@@ -382,9 +397,9 @@ class MainWindow(QMainWindow):
     def _build_footer(self) -> QFrame:
         bar = QFrame()
         bar.setObjectName("FooterBar")
-        bar.setFixedHeight(64)
+        bar.setFixedHeight(56)
         lay = QHBoxLayout(bar)
-        lay.setContentsMargins(18, 10, 18, 10)
+        lay.setContentsMargins(16, 8, 16, 8)
         lay.setSpacing(12)
 
         self.progress = QProgressBar()
@@ -445,6 +460,7 @@ class MainWindow(QMainWindow):
         self.act_about.triggered.connect(self._on_about)
         self.act_config_dir.triggered.connect(self._open_config_dir)
         self.act_log_dir.triggered.connect(self._show_log)
+        self.theme_btn.clicked.connect(self._toggle_theme)
 
         # 快捷键：Delete 移除选中
         act = QAction(self)
@@ -769,6 +785,7 @@ class MainWindow(QMainWindow):
             w.setEnabled(not busy)
         self.form.set_enabled_all(not busy)
         self.btn_start.setEnabled(not busy)
+        self.btn_start.setText("转换中…" if busy else "开始转换")
         self.btn_cancel.setEnabled(busy)
 
     # ---------------- 回调（主线程） ----------------
@@ -862,6 +879,21 @@ class MainWindow(QMainWindow):
         self.statusBar().showMessage("  ".join(parts) if parts else "已读取媒体信息", 8000)
 
     # ================= 其它 =================
+    def _toggle_theme(self) -> None:
+        self._set_dark(not is_dark())
+
+    def _set_dark(self, dark: bool, persist: bool = True) -> None:
+        """应用深 / 浅色液态玻璃主题；persist=True 时记住偏好。"""
+        apply_theme(QApplication.instance(), dark)
+        if persist:
+            self.settings.setValue("ui_dark", dark)
+        self.theme_btn.setText("浅色" if dark else "深色")
+        self.theme_btn.setToolTip("切换到浅色主题" if dark else "切换到深色主题")
+        cw = self.centralWidget()
+        if cw is not None:
+            cw.update()
+        self._flash("已切换为深色主题" if dark else "已切换为浅色主题", 2000)
+
     def open_output_folder(self) -> None:
         d = self._last_out_dir or self._out_dir
         if not d and self._jobs:
@@ -1062,7 +1094,7 @@ def run() -> int:
                 pass
     from PySide6.QtWidgets import QApplication
 
-    from .theme import apply_theme
+    from .theme import apply_theme, enable_window_glass
 
     app = QApplication(sys.argv)
     app.setApplicationName("MediaForge")
@@ -1070,5 +1102,6 @@ def run() -> int:
     app.setWindowIcon(QIcon(MainWindow._icon_path("icon.png")))
     apply_theme(app)
     window = MainWindow()
+    enable_window_glass(window)
     window.show()
     return app.exec()

@@ -18,6 +18,7 @@ from PySide6.QtWidgets import QFrame, QLabel, QSizePolicy, QVBoxLayout
 
 from ..core import formats as F
 from ..core import media_preview as mp
+from .theme import is_dark
 
 
 @dataclass
@@ -62,9 +63,9 @@ class _PreviewTask(QRunnable):
 
 def _error_pixmap(text: str) -> QPixmap:
     pm = QPixmap(400, 200)
-    pm.fill(QColor("#F8FAFD"))
+    pm.fill(QColor("#23252B" if is_dark() else "#F2F4F8"))
     p = QPainter(pm)
-    p.setPen(QPen(QColor("#9AA3B2")))
+    p.setPen(QPen(QColor("#98989F" if is_dark() else "#6E6E73")))
     f = p.font(); f.setPointSize(11); p.setFont(f)
     p.drawText(pm.rect(), Qt.AlignCenter, text[:200])
     p.end()
@@ -86,7 +87,7 @@ class MediaPreview(QFrame):
         lay.setSpacing(6)
 
         self.header = QLabel("预览（选中文件后自动生成）")
-        self.header.setStyleSheet("color:#6B7280;font-size:11px;font-weight:600;")
+        self.header.setObjectName("PreviewHeader")
         lay.addWidget(self.header)
 
         self.canvas = _PreviewCanvas(self)
@@ -129,9 +130,8 @@ class MediaPreview(QFrame):
 class _PreviewCanvas(QLabel):
     def __init__(self, parent=None):
         super().__init__(parent)
+        self.setObjectName("PreviewCanvas")
         self.setAlignment(Qt.AlignCenter)
-        self.setStyleSheet("background:#F8FAFD;border:1px solid #E5E7EB;"
-                           "border-radius:8px;color:#9AA3B2;font-size:12px;")
         self._pixmap = None
         self._waveform: list | None = None
         self.set_text("拖入文件后在此查看缩略图 / 波形")
@@ -181,8 +181,8 @@ class _PreviewCanvas(QLabel):
                 p.end()
                 return
             bar_w = max(1.0, (w - 16) / n)
-            mid_color = QColor("#2D6CDF")
-            peak_color = QColor("#5B8DEF")
+            mid_color = QColor("#0A84FF" if is_dark() else "#007AFF")
+            peak_color = QColor("#64D2FF" if is_dark() else "#5AC8FA")
             p.setPen(Qt.NoPen)
             for i, v in enumerate(self._waveform):
                 amp = max(0.0, min(1.0, float(v)))

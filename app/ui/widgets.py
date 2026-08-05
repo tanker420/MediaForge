@@ -218,7 +218,7 @@ class FileTable(QTableWidget):
         self.setAlternatingRowColors(True)
         self.setShowGrid(False)
         self.verticalHeader().setVisible(False)
-        self.verticalHeader().setDefaultSectionSize(40)
+        self.verticalHeader().setDefaultSectionSize(36)
         header = self.horizontalHeader()
         header.setSectionResizeMode(0, QHeaderView.Stretch)
         header.setSectionResizeMode(1, QHeaderView.ResizeToContents)

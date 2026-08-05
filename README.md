@@ -91,4 +91,4 @@ main.py                入口（默认 GUI，--cli 切换命令行）
 
 ## 📄 许可证
 
-[GPL-3.0](LICENSE) © MediaForge
+[GPL-3.0](LICENSE) © MediaForge（中文参考译文见 [LICENSE.zh-CN.txt](LICENSE.zh-CN.txt)，非官方译文，以英文原文为准）

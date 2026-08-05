@@ -72,8 +72,9 @@ def test_installer_app_mutex():
 
 def test_installer_license_and_icon_paths():
     iss = _read("packaging/installer.iss")
-    assert "..\\LICENSE" in iss
+    assert "..\\LICENSE.zh-CN.txt" in iss, "安装程序许可页应展示中文许可文件"
     assert (ROOT / "LICENSE").is_file()
+    assert (ROOT / "LICENSE.zh-CN.txt").is_file()
 
 
 # ---------------- 构建脚本 ----------------

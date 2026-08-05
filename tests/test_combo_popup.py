@@ -81,3 +81,20 @@ def test_popup_first_item_touches_top(window: MainWindow) -> None:
             f"{label} 首项 y={rect.top()}, 距 viewport 顶部有空隙 "
             f"（典型原因：QComboBox QAbstractItemView 残留 padding）"
         )
+
+
+def test_popup_selected_item_has_explicit_background() -> None:
+    """根因回归：QSS 必须在 ::item:selected 上显式声明背景与前景。
+
+    历史「下拉空白」Bug 的真正根因：popup 视图设了 selection-color: white，
+    但 ::item 子控件被样式化后选中背景不再取视图的 selection-background-color，
+    选中项渲染为白字白底的不可见空白行。若有人删掉 ::item:selected 规则，
+    这里会失败。
+    """
+    from app.ui.theme import QSS
+
+    assert "QComboBox QAbstractItemView::item:selected" in QSS
+    seg = QSS.split("QComboBox QAbstractItemView::item:selected", 1)[1]
+    seg = seg.split("}", 1)[0]
+    assert "background" in seg, "选中项必须显式声明背景，否则会白字白底"
+    assert "color" in seg, "选中项必须显式声明前景色"
