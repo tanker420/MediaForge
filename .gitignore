@@ -21,3 +21,10 @@ Thumbs.db
 
 # WorkBuddy 项目数据（记忆/日志，不入库）
 .workbuddy/
+
+# Android
+android/local.properties
+android/release.keystore
+android/.gradle/
+push_retry.log
+android/build.log

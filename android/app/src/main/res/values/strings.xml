@@ -1,0 +1,30 @@
+<?xml version="1.0" encoding="utf-8"?>
+<resources>
+    <string name="app_name">MediaForge</string>
+    <string name="tab_video">视频</string>
+    <string name="tab_audio">音频</string>
+    <string name="tab_image">图片</string>
+    <string name="add_files">添加文件</string>
+    <string name="remove_selected">移除选中</string>
+    <string name="clear_all">清空</string>
+    <string name="file_list">文件列表</string>
+    <string name="output_settings">输出设置</string>
+    <string name="output_format">输出格式</string>
+    <string name="video_encoder">视频编码器</string>
+    <string name="audio_encoder">音频编码器</string>
+    <string name="output_dir">输出位置</string>
+    <string name="choose_dir">浏览…</string>
+    <string name="reset_dir">重置</string>
+    <string name="naming_rule">命名规则</string>
+    <string name="start_convert">开始转换</string>
+    <string name="converting">转换中…</string>
+    <string name="cancel">取消</string>
+    <string name="ready">就绪</string>
+    <string name="theme_toggle">深色</string>
+    <string name="theme_toggle_night">浅色</string>
+    <string name="need_storage">需要「所有文件访问」权限才能读取和写出媒体文件</string>
+    <string name="no_files">请先添加要转换的文件</string>
+    <string name="drop_hint">点击「添加文件」选择要转换的媒体文件</string>
+    <string name="not_installed">（不支持）</string>
+    <string name="default_suffix">（默认）</string>
+</resources>
