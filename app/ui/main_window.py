@@ -45,7 +45,7 @@ from ..core.converter import ConversionQueue, Job, Status
 from ..core.ffprobe import ffmpeg_path, ffmpeg_version, invalidate_caches, probe
 from ..core.naming import build_output_path, collect_files, dedupe, human_size, human_time
 from .theme import (DANGER, SUCCESS, TEXT_SUB, WARNING, GlassBackdrop,
-                    apply_theme, is_dark)
+                    apply_theme, is_dark, set_titlebar_mode)
 from .preset_dialog import PresetManagerDialog
 from .preview import MediaPreview
 from .update_dialog import (
@@ -54,7 +54,7 @@ from .update_dialog import (
     _CheckBridge,
     _CheckTask,
 )
-from .widgets import FileTable, ParamForm, SegmentedControl
+from .widgets import FileTable, ParamForm, SegmentedControl, SliderParam
 
 KIND_LABEL = {F.VIDEO: "视频", F.AUDIO: "音频", F.IMAGE: "图片"}
 _KIND_EXTS = {
@@ -359,16 +359,29 @@ class MainWindow(QMainWindow):
         dir_row.addWidget(self.btn_resetdir)
         pv.addLayout(dir_row)
 
-        # 命名规则
+        # 命名规则：内置默认选项 + 自定义规则
         pv.addWidget(self._field_label("命名规则"))
         self.cb_pattern = QComboBox()
         for pattern, label in NAMED_PATTERNS:
             self.cb_pattern.addItem(label, pattern)
+        self.cb_pattern.addItem("自定义…", None)
+        pv.addWidget(self.cb_pattern)
+        self.ed_pattern = QLineEdit()
+        self.ed_pattern.setPlaceholderText(
+            "自定义规则，可用变量：{name} {ext} {date} {time} {index} {parent}")
+        self.ed_pattern.setToolTip(
+            "{name}=原文件名 {ext}=原扩展名 {date}=日期 {time}=时间 "
+            "{index}=序号 {parent}=上级目录名；留空回退为原文件名")
+        self.ed_pattern.setVisible(False)
+        pv.addWidget(self.ed_pattern)
         saved = self.settings.value("pattern", "{name}")
         idx = self.cb_pattern.findData(saved)
         if idx >= 0:
             self.cb_pattern.setCurrentIndex(idx)
-        pv.addWidget(self.cb_pattern)
+        else:
+            self.cb_pattern.setCurrentIndex(self.cb_pattern.count() - 1)
+            self.ed_pattern.setText(saved)
+        self.ed_pattern.setVisible(self.cb_pattern.currentData() is None)
 
         # 覆盖 + 并行
         opt_row = QHBoxLayout()
@@ -377,10 +390,11 @@ class MainWindow(QMainWindow):
         opt_row.addWidget(self.chk_overwrite)
         opt_row.addStretch(1)
         opt_row.addWidget(QLabel("并行任务"))
-        self.sp_workers = QSpinBox()
-        self.sp_workers.setRange(1, 8)
-        self.sp_workers.setValue(int(self.settings.value("workers", 2)))
-        opt_row.addWidget(self.sp_workers)
+        self.sp_workers = SliderParam(
+            F.Param("workers", "并行任务", "int", 2, minimum=1, maximum=8,
+                    help="同时转换的任务数，过高可能拖慢单个任务"))
+        self.sp_workers.set_value(int(self.settings.value("workers", 2)))
+        opt_row.addWidget(self.sp_workers, 1)
         pv.addLayout(opt_row)
 
         pv.addStretch(1)
@@ -452,9 +466,9 @@ class MainWindow(QMainWindow):
         self.chk_overwrite.setChecked(
             self.settings.value("overwrite", True, type=bool))
         self.sp_workers.valueChanged.connect(
-            lambda v: self.settings.setValue("workers", v))
-        self.cb_pattern.currentIndexChanged.connect(
-            lambda: self.settings.setValue("pattern", self.cb_pattern.currentData()))
+            lambda v: self.settings.setValue("workers", int(v)))
+        self.cb_pattern.currentIndexChanged.connect(self._on_pattern_changed)
+        self.ed_pattern.textChanged.connect(lambda _t: self._save_pattern())
 
         self.act_check_update.triggered.connect(self._on_manual_check_update)
         self.act_about.triggered.connect(self._on_about)
@@ -716,6 +730,20 @@ class MainWindow(QMainWindow):
         self.ed_outdir.clear()
         self.settings.setValue("out_dir", "")
 
+    # ---------------- 命名规则 ----------------
+    def _on_pattern_changed(self) -> None:
+        self.ed_pattern.setVisible(self.cb_pattern.currentData() is None)
+        self._save_pattern()
+
+    def _save_pattern(self) -> None:
+        self.settings.setValue("pattern", self._current_pattern())
+
+    def _current_pattern(self) -> str:
+        data = self.cb_pattern.currentData()
+        if data is not None:
+            return str(data)
+        return self.ed_pattern.text().strip() or "{name}"
+
     # ================= 转换执行 =================
     def _collect_params(self) -> dict:
         d = F.default_params_for(self.kind)
@@ -753,7 +781,7 @@ class MainWindow(QMainWindow):
         jobs: list[Job] = []
         for i, src in enumerate(files, 1):
             out_dir = self._out_dir or os.path.dirname(src)
-            dst = build_output_path(src, out_dir, ext, self.cb_pattern.currentData(),
+            dst = build_output_path(src, out_dir, ext, self._current_pattern(),
                                     overwrite=overwrite, index=i)
             dst = dedupe(dst, taken)
             jobs.append(Job(src=src, dst=dst, params=dict(params), kind=self.kind))
@@ -781,7 +809,8 @@ class MainWindow(QMainWindow):
         for w in (self.seg, self.btn_add, self.btn_adddir, self.btn_remove,
                   self.btn_clear, self.cb_preset, self.btn_presets, self.cb_fmt,
                   self.cb_vcodec, self.cb_acodec, self.ed_outdir, self.btn_browse,
-                  self.btn_resetdir, self.cb_pattern, self.chk_overwrite, self.sp_workers):
+                  self.btn_resetdir, self.cb_pattern, self.ed_pattern,
+                  self.chk_overwrite, self.sp_workers):
             w.setEnabled(not busy)
         self.form.set_enabled_all(not busy)
         self.btn_start.setEnabled(not busy)
@@ -885,6 +914,7 @@ class MainWindow(QMainWindow):
     def _set_dark(self, dark: bool, persist: bool = True) -> None:
         """应用深 / 浅色液态玻璃主题；persist=True 时记住偏好。"""
         apply_theme(QApplication.instance(), dark)
+        set_titlebar_mode(self, dark)
         if persist:
             self.settings.setValue("ui_dark", dark)
         self.theme_btn.setText("浅色" if dark else "深色")

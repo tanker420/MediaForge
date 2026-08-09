@@ -15,7 +15,12 @@ data class Param(
     val max: Double? = null,
     val step: Double = 1.0,
     val help: String = "",
+    val unit: String = "",                  // 固定单位后缀（手动输入不改单位）
+    val tier: String = ADVANCED,            // basic=一级常用；advanced=二级高级设置
 )
+
+const val BASIC = "basic"
+const val ADVANCED = "advanced"
 
 data class Codec(
     val encoder: String,
@@ -126,9 +131,11 @@ object Formats {
     private fun rateParams(defaultCrf: Double, crfMax: Double = 63.0, crfLabel: String = "CRF 质量"): List<Param> = listOf(
         Param("rate_mode", "码率控制模式", "choice", "crf",
             listOf("crf", "cbr", "vbr", "cq", "lossless"),
-            help = "crf=恒定质量；cbr=恒定码率；vbr=平均码率；cq=恒定量化；lossless=无损"),
-        Param("crf", crfLabel, "float", defaultCrf, min = 0.0, max = crfMax),
-        Param("bitrate", "目标码率", "str", "", help = "如 4000k、8M；CBR/VBR 模式下使用"),
+            help = "crf=恒定质量；cbr=恒定码率；vbr=平均码率；cq=恒定量化；lossless=无损",
+            tier = BASIC),
+        Param("crf", crfLabel, "float", defaultCrf, min = 0.0, max = crfMax, tier = BASIC),
+        Param("bitrate", "目标码率", "str", "", help = "如 4000k、8M；CBR/VBR 模式下使用",
+            tier = BASIC),
         Param("maxrate", "最大码率", "str", ""),
         Param("bufsize", "缓冲区大小", "str", ""),
         Param("minrate", "最小码率", "str", ""),
@@ -139,11 +146,12 @@ object Formats {
     val AUDIO_CODECS: Map<String, Codec>
 
     private val A_COMMON = listOf(
-        Param("audio_bitrate", "音频码率", "str", "192k"),
-        Param("sample_rate", "采样率 Hz", "choice", "", listOf("", "8000", "11025", "16000", "22050", "32000",
-            "44100", "48000", "88200", "96000", "176400", "192000")),
+        Param("audio_bitrate", "音频码率", "str", "192k", tier = BASIC),
+        Param("sample_rate", "采样率", "choice", "", listOf("", "8000", "11025", "16000", "22050", "32000",
+            "44100", "48000", "88200", "96000", "176400", "192000"), unit = "Hz"),
         Param("channels", "声道数", "choice", "", listOf("", "1", "2", "4", "6", "8")),
-        Param("volume", "音量调整 dB", "float", 0.0, min = -40.0, max = 40.0, step = 0.5),
+        Param("volume", "音量调整", "float", 0.0, min = -40.0, max = 40.0, step = 0.5,
+            unit = "dB", tier = BASIC),
     )
 
     init {
@@ -232,9 +240,9 @@ object Formats {
             "h264_amf" to "H.264 (AMD AMF)", "hevc_amf" to "H.265 (AMD AMF)",
             "av1_amf" to "AV1 (AMD AMF)")) {
             v += Codec(hw, label, VIDEO, listOf(
-                Param("rate_mode", "码率控制模式", "choice", "cq", listOf("cq", "cbr", "vbr")),
-                Param("crf", "质量 CQ/QP", "float", 23.0, min = 0.0, max = 51.0),
-                Param("bitrate", "目标码率", "str", "6000k"),
+                Param("rate_mode", "码率控制模式", "choice", "cq", listOf("cq", "cbr", "vbr"), tier = BASIC),
+                Param("crf", "质量 CQ/QP", "float", 23.0, min = 0.0, max = 51.0, tier = BASIC),
+                Param("bitrate", "目标码率", "str", "6000k", tier = BASIC),
                 Param("maxrate", "最大码率", "str", ""),
                 Param("bufsize", "缓冲区大小", "str", ""),
                 Param("preset", "硬件预设", "choice", "", listOf("", "p1", "p2", "p3", "p4", "p5", "p6", "p7",
@@ -272,25 +280,31 @@ object Formats {
             Param("vorbis_quality", "VBR 质量 -1~10", "float", 5.0, min = -1.0, max = 10.0, step = 0.5),
         ))
         a += Codec("flac", "FLAC 无损", AUDIO, listOf(
-            Param("sample_rate", "采样率 Hz", "choice", "", listOf("", "44100", "48000", "88200", "96000", "192000")),
+            Param("sample_rate", "采样率", "choice", "", listOf("", "44100", "48000", "88200", "96000", "192000"),
+                unit = "Hz"),
             Param("channels", "声道数", "choice", "", listOf("", "1", "2", "6", "8")),
-            Param("volume", "音量调整 dB", "float", 0.0, min = -40.0, max = 40.0, step = 0.5),
+            Param("volume", "音量调整", "float", 0.0, min = -40.0, max = 40.0, step = 0.5,
+                unit = "dB", tier = BASIC),
             Param("compression_level", "压缩级别 0-12", "int", 5, min = 0.0, max = 12.0),
             Param("sample_fmt", "采样格式", "choice", "s16", listOf("s16", "s32")),
         ))
         a += Codec("alac", "Apple 无损 ALAC", AUDIO, listOf(
-            Param("sample_rate", "采样率 Hz", "choice", "", listOf("", "44100", "48000", "96000", "192000")),
+            Param("sample_rate", "采样率", "choice", "", listOf("", "44100", "48000", "96000", "192000"),
+                unit = "Hz"),
             Param("channels", "声道数", "choice", "", listOf("", "1", "2", "6")),
-            Param("volume", "音量调整 dB", "float", 0.0, min = -40.0, max = 40.0, step = 0.5),
+            Param("volume", "音量调整", "float", 0.0, min = -40.0, max = 40.0, step = 0.5,
+                unit = "dB", tier = BASIC),
         ))
         for ((pcm, lbl) in listOf("pcm_s16le" to "PCM 16-bit", "pcm_s24le" to "PCM 24-bit",
             "pcm_s32le" to "PCM 32-bit", "pcm_f32le" to "PCM 32-bit 浮点",
             "pcm_u8" to "PCM 8-bit 无符号", "pcm_s16be" to "PCM 16-bit 大端",
             "pcm_s24be" to "PCM 24-bit 大端")) {
             a += Codec(pcm, lbl, AUDIO, listOf(
-                Param("sample_rate", "采样率 Hz", "choice", "", listOf("", "8000", "16000", "22050", "44100", "48000", "96000", "192000")),
+                Param("sample_rate", "采样率", "choice", "", listOf("", "8000", "16000", "22050", "44100", "48000", "96000", "192000"),
+                    unit = "Hz"),
                 Param("channels", "声道数", "choice", "", listOf("", "1", "2", "6", "8")),
-                Param("volume", "音量调整 dB", "float", 0.0, min = -40.0, max = 40.0, step = 0.5),
+                Param("volume", "音量调整", "float", 0.0, min = -40.0, max = 40.0, step = 0.5,
+                    unit = "dB", tier = BASIC),
             ))
         }
         a += Codec("ac3", "Dolby AC-3", AUDIO, A_COMMON)
@@ -314,41 +328,52 @@ object Formats {
     // 通用处理参数
     // ------------------------------------------------------------------
     val VIDEO_FILTER_PARAMS: List<Param> = listOf(
-        Param("width", "宽度 px", "int", 0, min = 0.0, max = 16384.0),
-        Param("height", "高度 px", "int", 0, min = 0.0, max = 16384.0),
-        Param("keep_aspect", "保持宽高比", "bool", true),
+        Param("width", "宽度", "int", 0, min = 0.0, max = 16384.0, help = "0=保持原样",
+            unit = "px", tier = BASIC),
+        Param("height", "高度", "int", 0, min = 0.0, max = 16384.0,
+            help = "0=保持原样；宽高其一填 -1 可等比", unit = "px", tier = BASIC),
+        Param("keep_aspect", "保持宽高比", "bool", true, tier = BASIC),
         Param("scale_flags", "缩放算法", "choice", "bicubic",
             listOf("fast_bilinear", "bilinear", "bicubic", "neighbor", "area", "bicublin", "gauss", "sinc", "lanczos", "spline")),
-        Param("fps", "帧率 fps", "str", ""),
+        Param("fps", "帧率", "str", "", help = "留空=保持原帧率，可填 24、30000/1001",
+            unit = "fps", tier = BASIC),
         Param("crop", "裁剪", "str", "", help = "格式 w:h:x:y"),
         Param("pad", "填充", "str", "", help = "格式 w:h:x:y:color"),
-        Param("rotate", "旋转", "choice", "0", listOf("0", "90", "180", "270")),
+        Param("rotate", "旋转", "choice", "0", listOf("0", "90", "180", "270"), tier = BASIC),
         Param("hflip", "水平翻转", "bool", false),
         Param("vflip", "垂直翻转", "bool", false),
         Param("deinterlace", "去隔行 (yadif)", "bool", false),
         Param("denoise", "降噪强度", "choice", "", listOf("", "light", "medium", "strong")),
         Param("sharpen", "锐化", "bool", false),
-        Param("brightness", "亮度 -1~1", "float", 0.0, min = -1.0, max = 1.0, step = 0.05),
-        Param("contrast", "对比度 0~4", "float", 1.0, min = 0.0, max = 4.0, step = 0.05),
-        Param("saturation", "饱和度 0~3", "float", 1.0, min = 0.0, max = 3.0, step = 0.05),
-        Param("gamma", "伽马 0.1~10", "float", 1.0, min = 0.1, max = 10.0, step = 0.05),
+        Param("brightness", "亮度", "float", 0.0, min = -1.0, max = 1.0, step = 0.05,
+            help = "-1~1，0=原始画面"),
+        Param("contrast", "对比度", "float", 1.0, min = 0.0, max = 4.0, step = 0.05,
+            help = "0~4，1=原始画面"),
+        Param("saturation", "饱和度", "float", 1.0, min = 0.0, max = 3.0, step = 0.05,
+            help = "0~3，1=原始画面"),
+        Param("gamma", "伽马", "float", 1.0, min = 0.1, max = 10.0, step = 0.05,
+            help = "0.1~10，1=原始画面"),
         Param("video_filter", "自定义视频滤镜链", "str", ""),
     )
 
     val AUDIO_FILTER_PARAMS: List<Param> = listOf(
         Param("normalize", "响度归一化 (EBU R128)", "bool", false),
-        Param("loudness_target", "目标响度 LUFS", "float", -16.0, min = -70.0, max = -5.0, step = 0.5),
-        Param("audio_fade_in", "淡入秒数", "float", 0.0, min = 0.0, max = 60.0, step = 0.1),
-        Param("audio_fade_out", "淡出秒数", "float", 0.0, min = 0.0, max = 60.0, step = 0.1),
-        Param("tempo", "变速倍率（不变调）", "float", 1.0, min = 0.5, max = 2.0, step = 0.05),
-        Param("pitch_semitones", "变调半音", "float", 0.0, min = -12.0, max = 12.0, step = 1.0),
+        Param("loudness_target", "目标响度", "float", -16.0, min = -70.0, max = -5.0, step = 0.5,
+            unit = "LUFS"),
+        Param("audio_fade_in", "淡入", "float", 0.0, min = 0.0, max = 60.0, step = 0.1, unit = "秒"),
+        Param("audio_fade_out", "淡出", "float", 0.0, min = 0.0, max = 60.0, step = 0.1, unit = "秒"),
+        Param("tempo", "变速（不变调）", "float", 1.0, min = 0.5, max = 2.0, step = 0.05,
+            unit = "倍"),
+        Param("pitch_semitones", "变调", "float", 0.0, min = -12.0, max = 12.0, step = 1.0,
+            unit = "半音"),
         Param("audio_filter", "自定义音频滤镜链", "str", ""),
     )
 
     val GENERAL_PARAMS: List<Param> = listOf(
-        Param("start_time", "起始时间", "str", ""),
-        Param("end_time", "结束时间", "str", ""),
-        Param("duration", "截取时长", "str", ""),
+        Param("start_time", "起始时间", "str", "", help = "如 00:00:10 或 10.5，留空=从头",
+            tier = BASIC),
+        Param("end_time", "结束时间", "str", "", help = "与时长二选一", tier = BASIC),
+        Param("duration", "截取时长", "str", "", help = "如 00:00:30", tier = BASIC),
         Param("threads", "线程数", "int", 0, min = 0.0, max = 64.0),
         Param("overwrite", "覆盖已存在文件", "bool", true),
         Param("strip_metadata", "移除元数据", "bool", false),
@@ -361,12 +386,14 @@ object Formats {
     )
 
     val IMAGE_PARAMS: List<Param> = listOf(
-        Param("width", "宽度 px", "int", 0, min = 0.0, max = 60000.0),
-        Param("height", "高度 px", "int", 0, min = 0.0, max = 60000.0),
-        Param("keep_aspect", "保持宽高比", "bool", true),
+        Param("width", "宽度", "int", 0, min = 0.0, max = 60000.0, help = "0=保持原样",
+            unit = "px", tier = BASIC),
+        Param("height", "高度", "int", 0, min = 0.0, max = 60000.0, unit = "px", tier = BASIC),
+        Param("keep_aspect", "保持宽高比", "bool", true, tier = BASIC),
         Param("resample", "重采样算法", "choice", "lanczos",
             listOf("nearest", "box", "bilinear", "hamming", "bicubic", "lanczos")),
-        Param("quality", "质量 1-100", "int", 90, min = 1.0, max = 100.0),
+        Param("quality", "质量", "int", 90, min = 1.0, max = 100.0,
+            help = "1~100，越高画质越好（JPEG/WebP/AVIF 等有损格式）", tier = BASIC),
         Param("lossless", "无损模式", "bool", false),
         Param("optimize", "优化体积", "bool", true),
         Param("progressive", "渐进式 JPEG", "bool", false),

@@ -35,6 +35,8 @@ class Param:
     """一个可设置的参数。
 
     type: str | int | float | bool | choice
+    unit: 固定单位后缀（独立于输入框显示，手动输入只改数值、不改单位）
+    tier: basic=一级常用设置；advanced=二级「高级设置」折叠区
     """
 
     key: str
@@ -46,6 +48,12 @@ class Param:
     maximum: float | None = None
     step: float = 1
     help: str = ""
+    unit: str = ""
+    tier: str = "advanced"
+
+
+BASIC = "basic"
+ADVANCED = "advanced"
 
 
 @dataclass(frozen=True)
@@ -161,10 +169,12 @@ def _rate_params(default_crf: float, crf_max: float = 63, crf_label: str = "CRF 
     return (
         Param("rate_mode", "码率控制模式", "choice", "crf",
               ("crf", "cbr", "vbr", "cq", "lossless"),
-              help="crf=恒定质量；cbr=恒定码率；vbr=平均码率；cq=恒定量化；lossless=无损"),
+              help="crf=恒定质量；cbr=恒定码率；vbr=平均码率；cq=恒定量化；lossless=无损",
+              tier=BASIC),
         Param("crf", crf_label, "float", default_crf, minimum=0, maximum=crf_max, step=1,
-              help="数值越小质量越高、文件越大"),
-        Param("bitrate", "目标码率", "str", "", help="如 4000k、8M；CBR/VBR 模式下使用"),
+              help="数值越小质量越高、文件越大", tier=BASIC),
+        Param("bitrate", "目标码率", "str", "", help="如 4000k、8M；CBR/VBR 模式下使用",
+              tier=BASIC),
         Param("maxrate", "最大码率", "str", "", help="配合 bufsize 限制峰值"),
         Param("bufsize", "缓冲区大小", "str", "", help="通常为 maxrate 的 1~2 倍"),
         Param("minrate", "最小码率", "str", ""),
@@ -285,9 +295,9 @@ for _hw, _label in (
     ("av1_amf", "AV1 (AMD AMF)"),
 ):
     _reg_v(Codec(_hw, _label, VIDEO, (
-        Param("rate_mode", "码率控制模式", "choice", "cq", ("cq", "cbr", "vbr")),
-        Param("crf", "质量 CQ/QP", "float", 23, minimum=0, maximum=51, step=1),
-        Param("bitrate", "目标码率", "str", "6000k"),
+        Param("rate_mode", "码率控制模式", "choice", "cq", ("cq", "cbr", "vbr"), tier=BASIC),
+        Param("crf", "质量 CQ/QP", "float", 23, minimum=0, maximum=51, step=1, tier=BASIC),
+        Param("bitrate", "目标码率", "str", "6000k", tier=BASIC),
         Param("maxrate", "最大码率", "str", ""),
         Param("bufsize", "缓冲区大小", "str", ""),
         Param("preset", "硬件预设", "choice", "", ("", "p1", "p2", "p3", "p4", "p5", "p6", "p7",
@@ -298,12 +308,14 @@ for _hw, _label in (
 
 # ---------------------------- 音频编码器 ----------------------------------
 _A_COMMON = (
-    Param("audio_bitrate", "音频码率", "str", "192k", help="如 128k、320k"),
-    Param("sample_rate", "采样率 Hz", "choice", "", ("", "8000", "11025", "16000", "22050", "32000",
-                                                     "44100", "48000", "88200", "96000", "176400", "192000")),
+    Param("audio_bitrate", "音频码率", "str", "192k", help="如 128k、320k", tier=BASIC),
+    Param("sample_rate", "采样率", "choice", "", ("", "8000", "11025", "16000", "22050", "32000",
+                                                     "44100", "48000", "88200", "96000", "176400", "192000"),
+          unit="Hz"),
     Param("channels", "声道数", "choice", "", ("", "1", "2", "4", "6", "8"),
           help="1=单声道 2=立体声 6=5.1 8=7.1"),
-    Param("volume", "音量调整 dB", "float", 0, minimum=-40, maximum=40, step=0.5),
+    Param("volume", "音量调整", "float", 0, minimum=-40, maximum=40, step=0.5, unit="dB",
+          tier=BASIC),
 )
 
 _reg_a(Codec("libmp3lame", "MP3 (LAME)", AUDIO, _A_COMMON + (
@@ -332,25 +344,31 @@ _reg_a(Codec("libvorbis", "Vorbis", AUDIO, _A_COMMON + (
     Param("vorbis_quality", "VBR 质量 -1~10", "float", 5, minimum=-1, maximum=10, step=0.5),
 )))
 _reg_a(Codec("flac", "FLAC 无损", AUDIO, (
-    Param("sample_rate", "采样率 Hz", "choice", "", ("", "44100", "48000", "88200", "96000", "192000")),
+    Param("sample_rate", "采样率", "choice", "", ("", "44100", "48000", "88200", "96000", "192000"),
+          unit="Hz"),
     Param("channels", "声道数", "choice", "", ("", "1", "2", "6", "8")),
-    Param("volume", "音量调整 dB", "float", 0, minimum=-40, maximum=40, step=0.5),
+    Param("volume", "音量调整", "float", 0, minimum=-40, maximum=40, step=0.5, unit="dB",
+          tier=BASIC),
     Param("compression_level", "压缩级别 0-12", "int", 5, minimum=0, maximum=12),
     Param("sample_fmt", "采样格式", "choice", "s16", ("s16", "s32")),
 ), lossless_capable=True))
 _reg_a(Codec("alac", "Apple 无损 ALAC", AUDIO, (
-    Param("sample_rate", "采样率 Hz", "choice", "", ("", "44100", "48000", "96000", "192000")),
+    Param("sample_rate", "采样率", "choice", "", ("", "44100", "48000", "96000", "192000"),
+          unit="Hz"),
     Param("channels", "声道数", "choice", "", ("", "1", "2", "6")),
-    Param("volume", "音量调整 dB", "float", 0, minimum=-40, maximum=40, step=0.5),
+    Param("volume", "音量调整", "float", 0, minimum=-40, maximum=40, step=0.5, unit="dB",
+          tier=BASIC),
 ), lossless_capable=True))
 for _pcm, _lbl in (("pcm_s16le", "PCM 16-bit"), ("pcm_s24le", "PCM 24-bit"),
                    ("pcm_s32le", "PCM 32-bit"), ("pcm_f32le", "PCM 32-bit 浮点"),
                    ("pcm_u8", "PCM 8-bit 无符号"), ("pcm_s16be", "PCM 16-bit 大端"),
                    ("pcm_s24be", "PCM 24-bit 大端")):
     _reg_a(Codec(_pcm, _lbl, AUDIO, (
-        Param("sample_rate", "采样率 Hz", "choice", "", ("", "8000", "16000", "22050", "44100", "48000", "96000", "192000")),
+        Param("sample_rate", "采样率", "choice", "", ("", "8000", "16000", "22050", "44100", "48000", "96000", "192000"),
+              unit="Hz"),
         Param("channels", "声道数", "choice", "", ("", "1", "2", "6", "8")),
-        Param("volume", "音量调整 dB", "float", 0, minimum=-40, maximum=40, step=0.5),
+        Param("volume", "音量调整", "float", 0, minimum=-40, maximum=40, step=0.5, unit="dB",
+              tier=BASIC),
     ), lossless_capable=True))
 _reg_a(Codec("ac3", "Dolby AC-3", AUDIO, _A_COMMON))
 _reg_a(Codec("eac3", "Dolby Digital Plus", AUDIO, _A_COMMON))
@@ -373,41 +391,51 @@ _reg_a(Codec("copy", "直接复制音频流（不重编码）", AUDIO, ()))
 # 通用（与编码器无关）的处理参数
 # --------------------------------------------------------------------------
 VIDEO_FILTER_PARAMS: tuple[Param, ...] = (
-    Param("width", "宽度 px", "int", 0, minimum=0, maximum=16384, help="0=保持原样"),
-    Param("height", "高度 px", "int", 0, minimum=0, maximum=16384, help="0=保持原样；宽高其一填 -1 可等比"),
-    Param("keep_aspect", "保持宽高比", "bool", True),
+    Param("width", "宽度", "int", 0, minimum=0, maximum=16384, help="0=保持原样", unit="px",
+          tier=BASIC),
+    Param("height", "高度", "int", 0, minimum=0, maximum=16384,
+          help="0=保持原样；宽高其一填 -1 可等比", unit="px", tier=BASIC),
+    Param("keep_aspect", "保持宽高比", "bool", True, tier=BASIC),
     Param("scale_flags", "缩放算法", "choice", "bicubic",
           ("fast_bilinear", "bilinear", "bicubic", "neighbor", "area", "bicublin", "gauss", "sinc", "lanczos", "spline")),
-    Param("fps", "帧率 fps", "str", "", help="留空=保持原帧率，可填 24、30000/1001"),
+    Param("fps", "帧率", "str", "", help="留空=保持原帧率，可填 24、30000/1001", unit="fps",
+          tier=BASIC),
     Param("crop", "裁剪", "str", "", help="格式 w:h:x:y"),
     Param("pad", "填充", "str", "", help="格式 w:h:x:y:color"),
-    Param("rotate", "旋转", "choice", "0", ("0", "90", "180", "270")),
+    Param("rotate", "旋转", "choice", "0", ("0", "90", "180", "270"), tier=BASIC),
     Param("hflip", "水平翻转", "bool", False),
     Param("vflip", "垂直翻转", "bool", False),
     Param("deinterlace", "去隔行 (yadif)", "bool", False),
     Param("denoise", "降噪强度", "choice", "", ("", "light", "medium", "strong")),
     Param("sharpen", "锐化", "bool", False),
-    Param("brightness", "亮度 -1~1", "float", 0, minimum=-1, maximum=1, step=0.05),
-    Param("contrast", "对比度 0~4", "float", 1, minimum=0, maximum=4, step=0.05),
-    Param("saturation", "饱和度 0~3", "float", 1, minimum=0, maximum=3, step=0.05),
-    Param("gamma", "伽马 0.1~10", "float", 1, minimum=0.1, maximum=10, step=0.05),
+    Param("brightness", "亮度", "float", 0, minimum=-1, maximum=1, step=0.05,
+          help="-1~1，0=原始画面"),
+    Param("contrast", "对比度", "float", 1, minimum=0, maximum=4, step=0.05,
+          help="0~4，1=原始画面"),
+    Param("saturation", "饱和度", "float", 1, minimum=0, maximum=3, step=0.05,
+          help="0~3，1=原始画面"),
+    Param("gamma", "伽马", "float", 1, minimum=0.1, maximum=10, step=0.05,
+          help="0.1~10，1=原始画面"),
     Param("video_filter", "自定义视频滤镜链", "str", "", help="追加到 -vf 之后的原始 filtergraph"),
 )
 
 AUDIO_FILTER_PARAMS: tuple[Param, ...] = (
     Param("normalize", "响度归一化 (EBU R128)", "bool", False),
-    Param("loudness_target", "目标响度 LUFS", "float", -16, minimum=-70, maximum=-5, step=0.5),
-    Param("audio_fade_in", "淡入秒数", "float", 0, minimum=0, maximum=60, step=0.1),
-    Param("audio_fade_out", "淡出秒数", "float", 0, minimum=0, maximum=60, step=0.1),
-    Param("tempo", "变速倍率（不变调）", "float", 1.0, minimum=0.5, maximum=2.0, step=0.05),
-    Param("pitch_semitones", "变调半音", "float", 0, minimum=-12, maximum=12, step=1),
+    Param("loudness_target", "目标响度", "float", -16, minimum=-70, maximum=-5, step=0.5,
+          unit="LUFS"),
+    Param("audio_fade_in", "淡入", "float", 0, minimum=0, maximum=60, step=0.1, unit="秒"),
+    Param("audio_fade_out", "淡出", "float", 0, minimum=0, maximum=60, step=0.1, unit="秒"),
+    Param("tempo", "变速（不变调）", "float", 1.0, minimum=0.5, maximum=2.0, step=0.05,
+          unit="倍"),
+    Param("pitch_semitones", "变调", "float", 0, minimum=-12, maximum=12, step=1, unit="半音"),
     Param("audio_filter", "自定义音频滤镜链", "str", ""),
 )
 
 GENERAL_PARAMS: tuple[Param, ...] = (
-    Param("start_time", "起始时间", "str", "", help="如 00:00:10 或 10.5，留空=从头"),
-    Param("end_time", "结束时间", "str", "", help="与时长二选一"),
-    Param("duration", "截取时长", "str", "", help="如 00:00:30"),
+    Param("start_time", "起始时间", "str", "", help="如 00:00:10 或 10.5，留空=从头",
+          tier=BASIC),
+    Param("end_time", "结束时间", "str", "", help="与时长二选一", tier=BASIC),
+    Param("duration", "截取时长", "str", "", help="如 00:00:30", tier=BASIC),
     Param("threads", "线程数", "int", 0, minimum=0, maximum=64, help="0=自动"),
     Param("overwrite", "覆盖已存在文件", "bool", True),
     Param("strip_metadata", "移除元数据", "bool", False),
@@ -422,12 +450,15 @@ GENERAL_PARAMS: tuple[Param, ...] = (
 
 # ---------------------------- 图片参数 ------------------------------------
 IMAGE_PARAMS: tuple[Param, ...] = (
-    Param("width", "宽度 px", "int", 0, minimum=0, maximum=60000, help="0=保持原样"),
-    Param("height", "高度 px", "int", 0, minimum=0, maximum=60000),
-    Param("keep_aspect", "保持宽高比", "bool", True),
+    Param("width", "宽度", "int", 0, minimum=0, maximum=60000, help="0=保持原样", unit="px",
+          tier=BASIC),
+    Param("height", "高度", "int", 0, minimum=0, maximum=60000, unit="px",
+          tier=BASIC),
+    Param("keep_aspect", "保持宽高比", "bool", True, tier=BASIC),
     Param("resample", "重采样算法", "choice", "lanczos",
           ("nearest", "box", "bilinear", "hamming", "bicubic", "lanczos")),
-    Param("quality", "质量 1-100", "int", 90, minimum=1, maximum=100, help="JPEG/WebP/AVIF 等有损格式"),
+    Param("quality", "质量", "int", 90, minimum=1, maximum=100,
+          help="1~100，越高画质越好（JPEG/WebP/AVIF 等有损格式）", tier=BASIC),
     Param("lossless", "无损模式", "bool", False, help="WebP/AVIF 支持"),
     Param("optimize", "优化体积", "bool", True),
     Param("progressive", "渐进式 JPEG", "bool", False),

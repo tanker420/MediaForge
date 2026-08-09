@@ -12,11 +12,10 @@
         <item name="colorOnSurfaceVariant">@color/app_on_surface_var</item>
         <item name="colorSurfaceVariant">@color/app_card</item>
         <item name="android:windowBackground">@color/app_surface</item>
-        <!-- 沉浸式：状态栏/导航栏透明，由代码按主题设置浅色/深色图标 -->
         <item name="android:statusBarColor">@android:color/transparent</item>
         <item name="android:navigationBarColor">@android:color/transparent</item>
-        <item name="android:windowLightStatusBar">true</item>
-        <item name="android:windowLightNavigationBar">true</item>
+        <item name="android:windowLightStatusBar">false</item>
+        <item name="android:windowLightNavigationBar">false</item>
     </style>
 
     <style name="TextAppearance.MediaForge.Title" parent="TextAppearance.Material3.TitleLarge">

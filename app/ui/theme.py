@@ -143,7 +143,7 @@ def apply_theme(app: QApplication, dark: bool = False) -> None:
 # 系统级材质（Windows DWM）+ 自绘液态玻璃背景
 # ---------------------------------------------------------------------------
 def enable_window_glass(window) -> bool:
-    """为系统原生标题栏启用 Mica 材质（Win11），客户区玻璃由 GlassBackdrop 自绘。
+    """为系统原生标题栏启用 Mica 材质（Win11）并按当前主题设置明暗。
 
     不在客户区开透明通道：Qt 原生标题栏 + WA_TranslucentBackground 在部分
     环境无法与 DWM 背景合成，会渲染出黑带。标题栏（最小化/最大化/关闭）
@@ -151,6 +151,13 @@ def enable_window_glass(window) -> bool:
     """
     if sys.platform != "win32":
         return False
+    mica = _set_titlebar_material(window)
+    set_titlebar_mode(window, is_dark())
+    return mica
+
+
+def _set_titlebar_material(window) -> bool:
+    """Win11 原生标题栏 Mica；失败静默降级。"""
     try:
         import ctypes
         if sys.getwindowsversion().build < 22000:
@@ -161,6 +168,26 @@ def enable_window_glass(window) -> bool:
             hwnd, 38, ctypes.byref(value), 4) == 0
     except Exception:  # noqa: BLE001
         return False
+
+
+def set_titlebar_mode(window, dark: bool) -> None:
+    """让原生标题栏（最小化/最大化/关闭那一行）跟随深浅主题。
+
+    Win10 1809+ 使用 DWMWA_USE_IMMERSIVE_DARK_MODE（控制按钮/文字明暗），
+    Win11 的 Mica 材质会随该属性自动切换深浅变体。失败静默忽略。
+    """
+    if sys.platform != "win32":
+        return
+    try:
+        import ctypes
+        if sys.getwindowsversion().build < 17763:
+            return
+        hwnd = int(window.winId())
+        flag = ctypes.c_int(1 if dark else 0)
+        ctypes.windll.dwmapi.DwmSetWindowAttribute(
+            hwnd, 20, ctypes.byref(flag), 4)  # USE_IMMERSIVE_DARK_MODE
+    except Exception:  # noqa: BLE001
+        pass
 
 
 class GlassBackdrop(QWidget):
@@ -516,6 +543,45 @@ QPushButton#PrimaryBtn:disabled {{
     background: rgba(0,122,255,90);
     color: rgba(255,255,255,200);
     border-color: transparent;
+}}
+
+/* ---------- 高级设置折叠按钮 ---------- */
+QPushButton#AdvancedToggle {{
+    background: transparent;
+    border: none;
+    border-radius: 6px;
+    color: {t['accent']};
+    font-weight: 600;
+    font-size: 12px;
+    padding: 4px 6px;
+    text-align: left;
+}}
+QPushButton#AdvancedToggle:hover {{
+    background: {t['btn_hover']};
+}}
+
+/* ---------- 滑块（细胶囊轨道 + 圆形手柄） ---------- */
+QSlider::groove:horizontal {{
+    border: none;
+    border-radius: 2px;
+    height: 4px;
+    background: {t['fill']};
+}}
+QSlider::handle:horizontal {{
+    background: qlineargradient(x1:0, y1:0, x2:0, y2:1,
+                                stop:0 {t['accent']}, stop:1 {t['accent_deep']});
+    border: none;
+    border-radius: 7px;
+    height: 14px;
+    width: 14px;
+    margin: -5px 0;
+}}
+QSlider::sub-page:horizontal {{
+    background: {t['accent']};
+    border-radius: 2px;
+}}
+QSlider:disabled {{
+    color: {t['dis_fg']};
 }}
 
 /* ---------- 进度条（细胶囊） ---------- */

@@ -1,0 +1,14 @@
+<?xml version="1.0" encoding="utf-8"?>
+<resources>
+    <color name="accent">#0A84FF</color>
+    <color name="accent_deep">#0062CC</color>
+    <color name="ic_launcher_bg">#0A84FF</color>
+
+    <!-- 语义化表面令牌（深色，iOS 风格纯黑底 + 深灰卡片） -->
+    <color name="app_surface">#000000</color>
+    <color name="app_on_surface">#F5F5F7</color>
+    <color name="app_on_surface_var">#98989F</color>
+    <color name="app_card">#1C1C1E</color>
+    <color name="app_fill">#2C2C2E</color>
+    <color name="app_hairline">#1FFFFFFF</color>
+</resources>

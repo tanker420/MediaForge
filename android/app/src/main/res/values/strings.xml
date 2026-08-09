@@ -27,4 +27,18 @@
     <string name="drop_hint">点击「添加文件」选择要转换的媒体文件</string>
     <string name="not_installed">（不支持）</string>
     <string name="default_suffix">（默认）</string>
+    <string name="advanced_settings">高级设置</string>
+    <string name="preset">预设</string>
+    <string name="manage_presets">管理…</string>
+    <string name="custom_option">自定义…</string>
+    <string name="preset_manager_title">预设管理</string>
+    <string name="preset_save">存当前为预设</string>
+    <string name="preset_overwrite">覆盖(重建)</string>
+    <string name="preset_rename">重命名</string>
+    <string name="preset_delete">删除</string>
+    <string name="preset_export">导出</string>
+    <string name="preset_import">导入</string>
+    <string name="preset_empty">暂无用户预设。先调好参数，再点「存当前为预设」。</string>
+    <string name="parallel_tasks">并行任务</string>
+    <string name="custom_pattern_hint">自定义规则，可用变量：{name} {ext} {date} {time} {index} {parent}</string>
 </resources>

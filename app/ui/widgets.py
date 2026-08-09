@@ -24,6 +24,7 @@ from PySide6.QtWidgets import (
     QLineEdit,
     QProgressBar,
     QPushButton,
+    QSlider,
     QSpinBox,
     QTableWidget,
     QTableWidgetItem,
@@ -71,10 +72,97 @@ class SegmentedControl(QFrame):
 
 
 # --------------------------------------------------------------------------
+# 滑块 + 数值框联动控件（有取值范围的参数专用）
+# --------------------------------------------------------------------------
+class SliderParam(QWidget):
+    """滑块与数值框双向联动。
+
+    防呆设计：数值框天然 clamp 到 [min, max]；单位是数值框的固定后缀，
+    手动输入只会改变数值、不会改动单位；滑块按 schema step 对齐刻度。
+    """
+
+    valueChanged = Signal(float)
+
+    def __init__(self, p: F.Param, parent: QWidget | None = None):
+        super().__init__(parent)
+        self._is_int = p.type == "int"
+        self._step = float(p.step or 1) or 1.0
+        self._lo = float(p.minimum) if p.minimum is not None else 0.0
+        self._hi = float(p.maximum) if p.maximum is not None else 100.0
+        if self._hi <= self._lo:
+            self._hi = self._lo + 1.0
+
+        lay = QHBoxLayout(self)
+        lay.setContentsMargins(0, 0, 0, 0)
+        lay.setSpacing(6)
+
+        self.slider = QSlider(Qt.Horizontal)
+        ticks = int(round((self._hi - self._lo) / self._step))
+        self.slider.setRange(0, max(1, ticks))
+        self.slider.setPageStep(max(1, max(1, ticks) // 10))
+        self.slider.setToolTip(p.help or "")
+        lay.addWidget(self.slider, 1)
+
+        if self._is_int:
+            self.spin: QSpinBox | QDoubleSpinBox = QSpinBox()
+            self.spin.setRange(int(self._lo), int(self._hi))
+            self.spin.setSingleStep(int(self._step) or 1)
+        else:
+            self.spin = QDoubleSpinBox()
+            self.spin.setRange(self._lo, self._hi)
+            self.spin.setSingleStep(self._step)
+            self.spin.setDecimals(2)
+        if p.unit:
+            self.spin.setSuffix(f" {p.unit}")
+        self.spin.setToolTip(p.help or f"{p.label}：{self._lo:g}~{self._hi:g}")
+        lay.addWidget(self.spin, 0)
+
+        self._syncing = False
+        self.slider.valueChanged.connect(self._on_slider)
+        self.spin.valueChanged.connect(self._on_spin)
+        self.set_value(p.default if p.default is not None else self._lo)
+
+    # ---------------- 联动 ----------------
+    def _on_slider(self, tick: int) -> None:
+        if self._syncing:
+            return
+        self._syncing = True
+        self.spin.setValue(self._lo + tick * self._step)
+        self._syncing = False
+        self.valueChanged.emit(self.value())
+
+    def _on_spin(self, v: float) -> None:
+        if self._syncing:
+            return
+        self._syncing = True
+        self.slider.setValue(int(round((v - self._lo) / self._step)))
+        self._syncing = False
+        self.valueChanged.emit(self.value())
+
+    # ---------------- 取值 ----------------
+    def value(self):
+        return self.spin.value() if self._is_int else float(self.spin.value())
+
+    def set_value(self, v: Any) -> None:
+        try:
+            fv = float(v)
+        except (TypeError, ValueError):
+            return
+        if self._is_int:
+            self.spin.setValue(int(round(fv)))   # 越界自动 clamp（防呆）
+        else:
+            self.spin.setValue(fv)
+
+
+# --------------------------------------------------------------------------
 # 自动参数表单
 # --------------------------------------------------------------------------
 class ParamForm(QWidget):
-    """依据 formats.Param 目录自动生成参数编辑控件。"""
+    """依据 formats.Param 目录自动生成参数编辑控件。
+
+    两级布局：tier=basic 的常用项直接展示；其余收进「高级设置」折叠区，
+    点击标题展开 / 收起，默认收起，降低界面噪音。
+    """
 
     def __init__(self, parent: QWidget | None = None):
         super().__init__(parent)
@@ -83,6 +171,8 @@ class ParamForm(QWidget):
         self._root = QVBoxLayout(self)
         self._root.setContentsMargins(0, 0, 0, 0)
         self._root.setSpacing(10)
+        self._adv_toggle: QPushButton | None = None
+        self._adv_box: QWidget | None = None
 
     def clear(self) -> None:
         for row in self._rows:
@@ -90,15 +180,53 @@ class ParamForm(QWidget):
             row.deleteLater()
         self._rows.clear()
         self._controls.clear()
+        self._adv_toggle = None
+        self._adv_box = None
 
     def set_params(self, params: Sequence[F.Param]) -> None:
         """重建表单。extra_args / overwrite 有专属入口，不再在表单中重复暴露。"""
         self.clear()
         shown = [p for p in params if p.key not in ("extra_args", "overwrite")]
-        for p in shown:
-            row = self._build_row(p)
-            self._root.addWidget(row)
-            self._rows.append(row)
+        basic = [p for p in shown if p.tier == F.BASIC]
+        advanced = [p for p in shown if p.tier != F.BASIC]
+
+        for p in basic:
+            self._add_row(p)
+
+        if advanced:
+            self._adv_toggle = QPushButton("高级设置 ▸")
+            self._adv_toggle.setObjectName("AdvancedToggle")
+            self._adv_toggle.setCursor(Qt.PointingHandCursor)
+            self._adv_toggle.setToolTip("展开 / 收起不常用的专业参数")
+            self._adv_toggle.clicked.connect(self._toggle_advanced)
+            self._root.addWidget(self._adv_toggle)
+            self._rows.append(self._adv_toggle)
+
+            self._adv_box = QWidget()
+            adv_lay = QVBoxLayout(self._adv_box)
+            adv_lay.setContentsMargins(8, 4, 0, 0)
+            adv_lay.setSpacing(10)
+            for p in advanced:
+                adv_lay.addWidget(self._build_row(p))
+            self._adv_box.setVisible(False)
+            self._root.addWidget(self._adv_box)
+            self._rows.append(self._adv_box)
+
+    def _toggle_advanced(self) -> None:
+        if self._adv_box is None or self._adv_toggle is None:
+            return
+        show = self._adv_box.isHidden()
+        self._adv_box.setVisible(show)
+        self._adv_toggle.setText("高级设置 ▾" if show else "高级设置 ▸")
+
+    def advanced_visible(self) -> bool:
+        # isVisible 在窗口未显示时恒为 False，故用 isHidden 判断折叠状态
+        return bool(self._adv_box is not None and not self._adv_box.isHidden())
+
+    def _add_row(self, p: F.Param) -> None:
+        row = self._build_row(p)
+        self._root.addWidget(row)
+        self._rows.append(row)
 
     # ---------------- 控件构建 ----------------
     def _build_row(self, p: F.Param) -> QWidget:
@@ -126,6 +254,8 @@ class ParamForm(QWidget):
             c = QCheckBox()
             c.setChecked(bool(p.default))
             return c
+        if t in ("int", "float") and p.minimum is not None and p.maximum is not None:
+            return SliderParam(p)
         if t == "int":
             c = QSpinBox()
             lo = int(p.minimum) if p.minimum is not None else -2_147_483_648
@@ -133,6 +263,8 @@ class ParamForm(QWidget):
             c.setRange(lo, hi)
             c.setSingleStep(int(p.step) or 1)
             c.setValue(int(p.default) if p.default is not None else lo)
+            if p.unit:
+                c.setSuffix(f" {p.unit}")
             return c
         if t == "float":
             c = QDoubleSpinBox()
@@ -142,6 +274,8 @@ class ParamForm(QWidget):
             c.setSingleStep(float(p.step or 0.1))
             c.setDecimals(2)
             c.setValue(float(p.default) if p.default is not None else 0.0)
+            if p.unit:
+                c.setSuffix(f" {p.unit}")
             return c
         if t == "choice":
             c = QComboBox()
@@ -154,13 +288,17 @@ class ParamForm(QWidget):
         c = QLineEdit()
         if p.default:
             c.setText(str(p.default))
+        if p.unit:
+            c.setPlaceholderText(p.unit)
         return c
 
     # ---------------- 取值 ----------------
     def values(self) -> dict[str, Any]:
         out: dict[str, Any] = {}
         for key, ctrl in self._controls.items():
-            if isinstance(ctrl, QCheckBox):
+            if isinstance(ctrl, SliderParam):
+                out[key] = ctrl.value()
+            elif isinstance(ctrl, QCheckBox):
                 out[key] = ctrl.isChecked()
             elif isinstance(ctrl, QSpinBox):
                 out[key] = ctrl.value()
@@ -177,7 +315,9 @@ class ParamForm(QWidget):
             ctrl = self._controls.get(key)
             if ctrl is None:
                 continue
-            if isinstance(ctrl, QCheckBox):
+            if isinstance(ctrl, SliderParam):
+                ctrl.set_value(val)
+            elif isinstance(ctrl, QCheckBox):
                 ctrl.setChecked(bool(val))
             elif isinstance(ctrl, QSpinBox):
                 try:
@@ -199,6 +339,8 @@ class ParamForm(QWidget):
     def set_enabled_all(self, enabled: bool) -> None:
         for ctrl in self._controls.values():
             ctrl.setEnabled(enabled)
+        if self._adv_toggle is not None:
+            self._adv_toggle.setEnabled(enabled)
 
 
 # --------------------------------------------------------------------------
