@@ -84,45 +84,76 @@ object Converter {
             listener?.onJobDone(job, false, "已取消")
             return
         }
-        val duration = probeDuration(job.src)
-        val passlog = if (Builder.needsTwoPass(job.params))
-            job.dst + ".passlog" else null
-
-        val passes = if (passlog != null) listOf(1, 2) else listOf(0)
-        for (passNo in passes) {
-            if (cancelled) {
-                listener?.onJobDone(job, false, "已取消")
+        // Motion Photo 输入：抽出内嵌 MP4 作为视频源
+        var src = job.src
+        var tmpVideo: String? = null
+        if (job.kind == Formats.VIDEO && Formats.isMotionPhoto(job.src)) {
+            tmpVideo = MotionPhoto.extractMicrovideo(job.src)
+            if (tmpVideo == null) {
+                listener?.onJobDone(job, false, "无法从 Live Photo 提取视频")
                 return
             }
-            val args = Builder.buildCommand(job.src, job.dst, job.params, duration, passNo, passlog)
-            val latch = CountDownLatch(1)
-            var ok = false
-            var msg = ""
-            FFmpegKit.executeAsync(
-                args.joinToString(" ") { quote(it) },
-                { session ->
-                    ok = ReturnCode.isSuccess(session.returnCode)
-                    msg = if (ok) "" else
-                        session.allLogsAsString.lines().takeLast(6).joinToString("\n")
-                    sessions.remove(job)
-                    latch.countDown()
-                },
-                null,
-                { stats ->
-                    val d = duration ?: 0.0
-                    if (d > 0 && passNo != 1) {
-                        val p = (stats.time / 1000.0 / d).toFloat().coerceIn(0f, 1f)
-                        listener?.onProgress(job, p, "")
-                    }
-                })
-                .let { sessions[job] = it }
-            latch.await()
-            if (!ok) {
-                listener?.onJobDone(job, false, msg.ifEmpty { "转换失败" })
-                return
-            }
+            src = tmpVideo
         }
-        listener?.onProgress(job, 1f, "")
-        listener?.onJobDone(job, true, "")
+        try {
+            // Motion Photo 输出：视频 → 实况照片（专用管线）
+            if (job.kind == Formats.VIDEO && Formats.isMotionPhoto(job.dst)) {
+                val ok = MotionPhoto.convert(src, job.dst, job.params) { cancelled }
+                if (cancelled) {
+                    listener?.onJobDone(job, false, "已取消")
+                    return
+                }
+                if (!ok) {
+                    listener?.onJobDone(job, false, "转换失败")
+                    return
+                }
+                listener?.onProgress(job, 1f, "")
+                listener?.onJobDone(job, true, "")
+                return
+            }
+
+            val duration = probeDuration(src)
+            val passlog = if (Builder.needsTwoPass(job.params))
+                job.dst + ".passlog" else null
+
+            val passes = if (passlog != null) listOf(1, 2) else listOf(0)
+            for (passNo in passes) {
+                if (cancelled) {
+                    listener?.onJobDone(job, false, "已取消")
+                    return
+                }
+                val args = Builder.buildCommand(src, job.dst, job.params, duration, passNo, passlog)
+                val latch = CountDownLatch(1)
+                var ok = false
+                var msg = ""
+                FFmpegKit.executeAsync(
+                    args.joinToString(" ") { quote(it) },
+                    { session ->
+                        ok = ReturnCode.isSuccess(session.returnCode)
+                        msg = if (ok) "" else
+                            session.allLogsAsString.lines().takeLast(6).joinToString("\n")
+                        sessions.remove(job)
+                        latch.countDown()
+                    },
+                    null,
+                    { stats ->
+                        val d = duration ?: 0.0
+                        if (d > 0 && passNo != 1) {
+                            val p = (stats.time / 1000.0 / d).toFloat().coerceIn(0f, 1f)
+                            listener?.onProgress(job, p, "")
+                        }
+                    })
+                    .let { sessions[job] = it }
+                latch.await()
+                if (!ok) {
+                    listener?.onJobDone(job, false, msg.ifEmpty { "转换失败" })
+                    return
+                }
+            }
+            listener?.onProgress(job, 1f, "")
+            listener?.onJobDone(job, true, "")
+        } finally {
+            if (tmpVideo != null) runCatching { java.io.File(tmpVideo).delete() }
+        }
     }
 }

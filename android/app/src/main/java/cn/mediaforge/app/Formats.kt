@@ -63,6 +63,7 @@ object Formats {
         ContainerFormat("gif", "GIF 动画", VIDEO, "gif", listOf("gif")),
         ContainerFormat("webp", "WebP 动图", VIDEO, "webp", listOf("libwebp")),
         ContainerFormat("apng", "APNG 动图", VIDEO, "apng", listOf("apng")),
+        ContainerFormat("mp.jpg", "Live Photo 动态照片", VIDEO, null, listOf("libx264"), listOf("aac", "copy")),
         ContainerFormat("mxf", "MXF 广播格式", VIDEO, "mxf", listOf("mpeg2video", "dnxhd", "libx264"), listOf("pcm_s16le")),
     )
 
@@ -111,9 +112,20 @@ object Formats {
         ContainerFormat("sgi", "SGI", IMAGE),
     )
 
+    // Motion Photo（实况照片 / 动态照片）文件名后缀（Google 惯例 *.MP.jpg）。
+    val MOTION_PHOTO_SUFFIXES = setOf("mp.jpg", "mp.jpeg", "mpjpeg")
+
+    fun isMotionPhoto(path: String): Boolean =
+        MOTION_PHOTO_SUFFIXES.any { path.lowercase().endsWith(".$it") }
+
+    /** 返回用于白名单匹配的扩展名；Motion Photo 特判为 mp.jpg。 */
+    fun inputExt(path: String): String =
+        if (isMotionPhoto(path)) "mp.jpg" else path.substringAfterLast('.', "").lowercase()
+
     val INPUT_VIDEO_EXT: Set<String> = VIDEO_FORMATS.map { it.ext }.toSet() + setOf(
         "m2ts", "mts", "vob", "rmvb", "rm", "asf", "divx", "f4v", "h264", "hevc",
-        "m2v", "mpeg", "mpv", "ogm", "swf", "y4m", "dv", "amv", "nut")
+        "m2v", "mpeg", "mpv", "ogm", "swf", "y4m", "dv", "amv", "nut") +
+        MOTION_PHOTO_SUFFIXES
     val INPUT_AUDIO_EXT: Set<String> = AUDIO_FORMATS.map { it.ext }.toSet() + setOf(
         "ape", "dts", "mpc", "ra", "shn", "voc", "w64", "gsm", "oga", "m4b", "8svx")
     val INPUT_IMAGE_EXT: Set<String> = IMAGE_FORMATS.map { it.ext }.toSet() + setOf(
@@ -437,6 +449,7 @@ object Formats {
     }
 
     fun detectKind(path: String): String {
+        if (isMotionPhoto(path)) return VIDEO
         val ext = path.substringAfterLast('.', "").lowercase()
         val animated = ext in setOf("gif", "webp", "apng")
         if (ext in INPUT_IMAGE_EXT && !animated) return IMAGE

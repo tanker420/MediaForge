@@ -11,8 +11,8 @@ android {
         applicationId = "cn.mediaforge.app"
         minSdk = 24
         targetSdk = 34
-        versionCode = 130
-        versionName = "1.3.0"
+        versionCode = 140
+        versionName = "1.4.0"
         ndk { abiFilters += listOf("armeabi-v7a", "arm64-v8a") }
     }
 

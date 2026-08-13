@@ -334,9 +334,12 @@ object Builder {
         if (b(p, "grayscale")) vf += "format=gray"
         if (vf.isNotEmpty()) args += listOf("-vf", vf.joinToString(","))
 
+        // 显式指定 -c:v 编码器（ffmpeg 对 avif/heif/jp2 等无法仅凭扩展名自动选编码器，
+        // 且 webp 必须用 -compression_level 而非 -method，否则 ffmpeg-kit 报 Unknown option）。
+        val q = i(p, "quality", 90)
         when (outExt) {
-            "jpg", "jpeg" -> {
-                val q = i(p, "quality", 90)
+            "jpg", "jpeg", "jfif" -> {
+                args += listOf("-c:v", "mjpeg")
                 // mjpeg qscale 1(最好)~31(最差) 的近似映射
                 args += listOf("-q:v", "${maxOf(1, minOf(31, (100 - q) / 3 + 1))}")
                 when (s(p, "subsampling")) {
@@ -345,13 +348,35 @@ object Builder {
                     "4:2:0" -> args += listOf("-pix_fmt", "yuvj420p")
                 }
             }
+            "png" -> args += listOf("-c:v", "png",
+                "-compression_level", "${i(p, "png_compress_level", 6)}")
             "webp" -> {
-                args += listOf("-quality", "${i(p, "quality", 90)}",
-                    "-method", "${i(p, "webp_method", 4)}")
+                args += listOf("-c:v", "libwebp", "-quality", "$q",
+                    "-compression_level", "${i(p, "webp_method", 4)}")
                 if (b(p, "lossless")) args += listOf("-lossless", "1")
             }
-            "png" -> args += listOf("-compression_level", "${i(p, "png_compress_level", 6)}")
-            "tiff" -> s(p, "tiff_compression").let { if (it.isNotEmpty()) args += listOf("-compression", it) }
+            "gif" -> args += listOf("-c:v", "gif")
+            "bmp" -> args += listOf("-c:v", "bmp")
+            "tiff", "tif" -> {
+                args += listOf("-c:v", "tiff")
+                s(p, "tiff_compression").let { if (it.isNotEmpty()) args += listOf("-compression", it) }
+            }
+            "tga" -> args += listOf("-c:v", "targa")
+            "ppm" -> args += listOf("-c:v", "ppm")
+            "pgm" -> args += listOf("-c:v", "pgm")
+            "pbm" -> args += listOf("-c:v", "ppm")
+            "avif" -> {
+                // libaom CRF 0~63，质量 1~100 → 63~0
+                val crf = ((100 - q) * 63 / 100).coerceIn(0, 63)
+                args += listOf("-c:v", "libaom-av1", "-crf", "$crf", "-still-picture", "1")
+            }
+            "heif", "heic" -> {
+                // libx265 CRF 0~51，质量 1~100 → 51~0（需 heif 复用器，缺失时清晰报错）
+                val crf = ((100 - q) * 51 / 100).coerceIn(0, 51)
+                args += listOf("-c:v", "libx265", "-crf", "$crf", "-f", "heif")
+            }
+            "jp2", "j2k" -> args += listOf("-c:v", "libopenjpeg")
+            // ico/dds/eps/pdf/pcx/im/sgi/qoi/svg：ffmpeg 无对应编码器，交由自动探测（会清晰报错）
         }
         if (b(p, "strip_metadata")) args += listOf("-map_metadata", "-1")
         args += listOf("-frames:v", "1")

@@ -88,6 +88,7 @@ VIDEO_FORMATS: tuple[ContainerFormat, ...] = (
     ContainerFormat("gif", "GIF 动画", VIDEO, "gif", ("gif",), ()),
     ContainerFormat("webp", "WebP 动图", VIDEO, "webp", ("libwebp",), ()),
     ContainerFormat("apng", "APNG 动图", VIDEO, "apng", ("apng",), ()),
+    ContainerFormat("mp.jpg", "Live Photo 动态照片", VIDEO, video_codecs=("libx264",), audio_codecs=("aac", "copy"), notes="视频转实况照片，兼容 Google Photos / 安卓相册"),
     ContainerFormat("mxf", "MXF 广播格式", VIDEO, "mxf", ("mpeg2video", "dnxhd", "libx264"), ("pcm_s16le",)),
 )
 
@@ -142,11 +143,28 @@ IMAGE_FORMATS: tuple[ContainerFormat, ...] = (
     ContainerFormat("sgi", "SGI", IMAGE),
 )
 
+# Motion Photo（实况照片 / 动态照片）的文件名后缀（Google 惯例 *.MP.jpg）。
+# 这类文件本质是「JPEG + 尾部拼接 MP4」，识别时按视频处理（取内嵌视频）。
+MOTION_PHOTO_SUFFIXES = ("mp.jpg", "mp.jpeg", "mpjpeg")
+
+
+def is_motion_photo(path: str) -> bool:
+    """判断文件是否为 Motion Photo（Live Photo 单文件格式）。"""
+    return path.lower().endswith(MOTION_PHOTO_SUFFIXES)
+
+
+def input_ext(path: str) -> str:
+    """返回用于白名单匹配的扩展名；Motion Photo 特判为完整后缀（mp.jpg）。"""
+    if is_motion_photo(path):
+        return "mp.jpg"
+    return path.rsplit(".", 1)[-1].lower() if "." in path else ""
+
+
 # 可读取的输入扩展名（比可写的更宽）
 INPUT_VIDEO_EXT = tuple(sorted({f.ext for f in VIDEO_FORMATS} | {
     "m2ts", "mts", "vob", "rmvb", "rm", "asf", "divx", "f4v", "h264", "hevc",
     "m2v", "mpeg", "mpv", "ogm", "swf", "y4m", "dv", "amv", "nut",
-}))
+} | set(MOTION_PHOTO_SUFFIXES)))
 INPUT_AUDIO_EXT = tuple(sorted({f.ext for f in AUDIO_FORMATS} | {
     "ape", "dts", "mpc", "ra", "shn", "voc", "w64", "gsm", "oga", "m4b", "8svx",
 }))
@@ -510,6 +528,8 @@ def find_format(ext: str, kind: str | None = None) -> ContainerFormat | None:
 
 
 def detect_kind(path: str) -> str:
+    if is_motion_photo(path):
+        return VIDEO
     ext = path.rsplit(".", 1)[-1].lower() if "." in path else ""
     if ext in INPUT_IMAGE_EXT and ext not in ("gif", "webp", "apng"):
         return IMAGE

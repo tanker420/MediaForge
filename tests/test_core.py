@@ -131,6 +131,17 @@ def test_find_preset():
     assert P.find_preset("不存在的预设") is None
 
 
+# ---------------- CLI ----------------
+def test_cli_overwrite_defaults_true():
+    """CLI 的 --overwrite/--no-overwrite 互斥组，未显式指定时默认应为覆盖（True）。"""
+    from app.cli import build_parser
+    assert build_parser().parse_args(["-i", "x.mp4", "-F", "mp4"]).overwrite is True
+    assert build_parser().parse_args(
+        ["-i", "x.mp4", "-F", "mp4", "--overwrite"]).overwrite is True
+    assert build_parser().parse_args(
+        ["-i", "x.mp4", "-F", "mp4", "--no-overwrite"]).overwrite is False
+
+
 def test_user_presets_roundtrip(tmp_path, monkeypatch):
     monkeypatch.setattr(P, "config_dir", lambda: tmp_path)
     P.save_user_presets([P.Preset("我的预设", F.VIDEO, "mkv", {"crf": 18})])

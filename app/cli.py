@@ -62,6 +62,10 @@ def build_parser() -> argparse.ArgumentParser:
                            help="覆盖已存在的同名文件（默认行为）")
     overwrite.add_argument("--no-overwrite", dest="overwrite", action="store_false",
                            help="跳过已存在的同名文件（自动追加 (1)(2)… 后缀）")
+    # 修复：store_true/store_false 共用一个 dest 时，默认值会被后注册的
+    # action 覆盖为 False，导致「未显式指定时」实际按「不覆盖」处理。
+    # 这里显式恢复为 True，与文档及 GUI 默认一致。
+    overwrite.set_defaults(overwrite=True)
 
     info = parser.add_argument_group("信息与维护")
     info.add_argument("--dry-run", action="store_true",

@@ -16,6 +16,7 @@ from typing import Any
 
 from . import formats as F
 from . import image_engine
+from . import motion_photo
 from .ffmpeg_builder import build_command, needs_two_pass
 from .ffprobe import CREATE_NO_WINDOW, MediaInfo, probe, require_ffmpeg
 
@@ -172,28 +173,55 @@ def run_job(job: Job, on_progress: ProgressCB | None = None,
             job.progress = 1.0
         else:
             require_ffmpeg()
-            if job.info is None:
-                job.info = probe(job.src)
-            duration = job.info.duration if job.info else 0.0
-            # 有裁剪时按裁剪时长算进度
-            params = dict(job.params)
-            params["_duration"] = duration
-            a_stream = job.info.audio if job.info else None
-            if a_stream and a_stream.sample_rate:
-                params["_sample_rate"] = a_stream.sample_rate
-            trimmed = _effective_duration(params, duration)
+            src = job.src
+            tmp_video: str | None = None
+            # Motion Photo 输入：先抽出内嵌 MP4，再走常规视频转换
+            if job.kind == F.VIDEO and motion_photo.is_motion_photo_input(job.src):
+                try:
+                    tmp_video = motion_photo.extract_microvideo(job.src, cancel)
+                    src = tmp_video
+                    job.info = probe(src)
+                except motion_photo.Canceled:
+                    raise Canceled from None
 
-            if needs_two_pass(params):
-                with tempfile.TemporaryDirectory() as tmp:
-                    log = os.path.join(tmp, "ffpass")
-                    _run_ffmpeg(build_command(job.src, job.dst, params, job.info, 1, log),
-                                job, trimmed, on_progress, cancel, 0.0, 0.5)
-                    _run_ffmpeg(build_command(job.src, job.dst, params, job.info, 2, log),
-                                job, trimmed, on_progress, cancel, 0.5, 0.5)
-            else:
-                _run_ffmpeg(build_command(job.src, job.dst, params, job.info),
-                            job, trimmed, on_progress, cancel)
-            job.progress = 1.0
+            try:
+                if job.info is None:
+                    job.info = probe(src)
+
+                # 视频 → Live Photo（Motion Photo）专用管线
+                if job.kind == F.VIDEO and motion_photo.is_motion_photo_output(job.dst):
+                    motion_photo.convert(src, job.dst, job.params, cancel,
+                                         on_progress=_mp_progress(job, on_progress))
+                    job.progress = 1.0
+                else:
+                    duration = job.info.duration if job.info else 0.0
+                    # 有裁剪时按裁剪时长算进度
+                    params = dict(job.params)
+                    params["_duration"] = duration
+                    a_stream = job.info.audio if job.info else None
+                    if a_stream and a_stream.sample_rate:
+                        params["_sample_rate"] = a_stream.sample_rate
+                    trimmed = _effective_duration(params, duration)
+
+                    if needs_two_pass(params):
+                        with tempfile.TemporaryDirectory() as tmp:
+                            log = os.path.join(tmp, "ffpass")
+                            _run_ffmpeg(build_command(src, job.dst, params, job.info, 1, log),
+                                        job, trimmed, on_progress, cancel, 0.0, 0.5)
+                            _run_ffmpeg(build_command(src, job.dst, params, job.info, 2, log),
+                                        job, trimmed, on_progress, cancel, 0.5, 0.5)
+                    else:
+                        _run_ffmpeg(build_command(src, job.dst, params, job.info),
+                                    job, trimmed, on_progress, cancel)
+                    job.progress = 1.0
+            except motion_photo.Canceled:
+                raise Canceled from None
+            finally:
+                if tmp_video:
+                    try:
+                        os.remove(tmp_video)
+                    except OSError:
+                        pass
 
         job.status = Status.DONE
         try:
@@ -224,6 +252,15 @@ def _cleanup_partial(job: Job) -> None:
             os.remove(job.dst)
     except OSError:
         pass
+
+
+def _mp_progress(job: Job, on_progress: ProgressCB | None) -> Callable[[float], None]:
+    """把 Motion Photo 管线的 0~1 进度写回 job 并通知 UI。"""
+    def cb(p: float) -> None:
+        job.progress = min(1.0, max(0.0, p))
+        if on_progress:
+            on_progress(job)
+    return cb
 
 
 def _effective_duration(params: dict[str, Any], total: float) -> float:

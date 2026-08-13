@@ -620,7 +620,7 @@ class MainWindow(QMainWindow):
         self._apply_kind(self.kind)
     def _visible_files(self) -> list[str]:
         pool = _KIND_EXTS[self.kind]
-        return [f for f in self.files if f.rsplit(".", 1)[-1].lower() in pool]
+        return [f for f in self.files if F.input_ext(f) in pool]
 
     def add_files(self, paths: list[str]) -> None:
         files: list[str] = []
@@ -635,7 +635,7 @@ class MainWindow(QMainWindow):
 
         # 先按真实类别过滤，确定首个文件所属类别
         valid = [f for f in files if any(
-            f.rsplit(".", 1)[-1].lower() in pool for pool in _KIND_EXTS.values())]
+            F.input_ext(f) in pool for pool in _KIND_EXTS.values())]
         if not valid:
             self._flash("没有找到可转换的媒体文件")
             return
@@ -648,7 +648,7 @@ class MainWindow(QMainWindow):
             self._rebuild_table()
 
         pool = _KIND_EXTS[self.kind]
-        matched = [f for f in valid if f.rsplit(".", 1)[-1].lower() in pool]
+        matched = [f for f in valid if F.input_ext(f) in pool]
         existing = set(self.files)
         new = [f for f in matched if f not in existing]
         skipped = len(matched) - len(new)
