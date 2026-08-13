@@ -60,12 +60,12 @@ python main.py --cli -i ./素材目录 -F mp3 -p audio_bitrate=192k --workers 4
 python main.py --cli --list-formats
 ```
 
-## 🔧 自行打包 Windows 安装包
+## 🔧 自行打包 Windows 安装包与 Android APK
 
 见 [如何生成安装程序.md](如何生成安装程序.md)。支持两种方式：
 
 - **本地一键打包**：安装 Python 与 Inno Setup 后运行 `packaging\build_windows.bat`
-- **GitHub Actions**：推送 `v*` 标签自动构建并发布 Release
+- **GitHub Actions**：推送 `v*` 标签自动构建 **Windows 安装包 + Android APK** 并一起发布 Release（安卓签名可配 Secret `ANDROID_KEYSTORE_BASE64`，见文档 §3.1）
 
 ## 🏗 技术架构
 
