@@ -22,6 +22,9 @@ Thumbs.db
 # WorkBuddy 项目数据（记忆/日志，不入库）
 .workbuddy/
 
+# Trae AI 配置（不入库）
+.trae/
+
 # Android
 android/local.properties
 android/release.keystore
