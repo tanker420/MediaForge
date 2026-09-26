@@ -246,9 +246,10 @@ def run_job(job: Job, on_progress: ProgressCB | None = None,
 
 
 def _cleanup_partial(job: Job) -> None:
-    """删除中断产生的残缺输出。"""
+    """删除中断/失败产生的残缺输出（不仅限 0 字节——ffmpeg 中途失败
+    常留下无 moov 的损坏 mp4，一并清理）。"""
     try:
-        if os.path.exists(job.dst) and os.path.getsize(job.dst) == 0:
+        if os.path.exists(job.dst):
             os.remove(job.dst)
     except OSError:
         pass

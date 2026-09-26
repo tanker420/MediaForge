@@ -12,6 +12,7 @@ from __future__ import annotations
 import os
 import subprocess
 import sys
+import time
 from pathlib import Path
 
 from PySide6.QtCore import QObject, QSettings, QRunnable, Qt, QThreadPool, Signal
@@ -477,10 +478,10 @@ class MainWindow(QMainWindow):
         self.theme_btn.clicked.connect(self._toggle_theme)
 
         # 快捷键：Delete 移除选中
-        act = QAction(self)
-        act.setShortcut(Qt.Key_Delete)
-        act.triggered.connect(self._remove_selected)
-        self.addAction(act)
+        self._act_del = QAction(self)
+        self._act_del.setShortcut(Qt.Key_Delete)
+        self._act_del.triggered.connect(self._remove_selected)
+        self.addAction(self._act_del)
 
     # ================= 类别与格式 =================
     @property
@@ -747,8 +748,10 @@ class MainWindow(QMainWindow):
     # ================= 转换执行 =================
     def _collect_params(self) -> dict:
         d = F.default_params_for(self.kind)
-        d.update(self.form.values())
+        # _extra 先合并：预设套用后其值已通过 _rebuild_form 写入表单，
+        # 用户在表单上的手动修改必须优先生效；_extra 仅兜底表单没有的 key
         d.update(self._extra)
+        d.update(self.form.values())
         if self._has_vcodec:
             d["video_codec"] = self.cb_vcodec.currentData() or ""
         if self._has_acodec:
@@ -813,6 +816,7 @@ class MainWindow(QMainWindow):
                   self.chk_overwrite, self.sp_workers):
             w.setEnabled(not busy)
         self.form.set_enabled_all(not busy)
+        self._act_del.setEnabled(not busy)
         self.btn_start.setEnabled(not busy)
         self.btn_start.setText("转换中…" if busy else "开始转换")
         self.btn_cancel.setEnabled(busy)
@@ -993,6 +997,15 @@ class MainWindow(QMainWindow):
             if ret != QMessageBox.Yes:
                 event.ignore()
                 return
+            # 先取消并等工作线程结束，避免 ffmpeg 成为孤儿进程
+            self.queue.cancel()
+            self.lbl_status.setText("正在终止转换…")
+            QApplication.processEvents()
+            # ffmpeg terminate 最多 5s/任务，超时兜底不等死
+            deadline = time.monotonic() + 8
+            while self.queue.running and time.monotonic() < deadline:
+                time.sleep(0.05)
+                QApplication.processEvents()
         event.accept()
 
 

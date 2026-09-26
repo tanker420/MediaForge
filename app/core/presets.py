@@ -173,7 +173,11 @@ def save_user_presets(presets: list[Preset]) -> None:
     data = [{"name": p.name, "kind": p.kind, "ext": p.ext,
              "params": p.params, "description": p.description}
             for p in presets if not p.builtin]
-    _user_file().write_text(json.dumps(data, ensure_ascii=False, indent=2), "utf-8")
+    # 原子写入：先写临时文件再替换，避免中途崩溃留下损坏 JSON
+    path = _user_file()
+    tmp = path.with_suffix(".json.tmp")
+    tmp.write_text(json.dumps(data, ensure_ascii=False, indent=2), "utf-8")
+    os.replace(tmp, path)
 
 
 def _persist(presets: list[Preset]) -> None:
@@ -249,10 +253,32 @@ def export_presets(presets: list[Preset], path: str) -> None:
     Path(path).write_text(json.dumps(data, ensure_ascii=False, indent=2), "utf-8")
 
 
+# 导入预设时剔除的自由文本键：这些字段会被原样拼进 ffmpeg 命令行，
+# 来自不可信 JSON 时可构成参数注入（如 extra_args 里的额外 -i/-o）。
+_UNSAFE_IMPORT_KEYS = ("extra_args", "video_filter", "audio_filter",
+                       "subtitle_file", "x264_params", "x265_params",
+                       "svtav1_params")
+_VALID_KINDS = ("video", "audio", "image")
+
+
+def _sanitize_import_params(params: object, dropped: list[str]) -> dict:
+    """剔除不安全的自由文本参数，返回干净的 dict。dropped 记录被剔除的键名。"""
+    if not isinstance(params, dict):
+        return {}
+    clean = {}
+    for k, v in params.items():
+        if k in _UNSAFE_IMPORT_KEYS and v not in (None, "", 0, False):
+            dropped.append(k)
+            continue
+        clean[k] = v
+    return clean
+
+
 def import_presets(path: str) -> tuple[int, list[str]]:
     """从 JSON 文件导入预设；返回 (新增数量, 跳过的预设名列表)。
 
-    跳过条件：与已有内置或用户预设同名；JSON 损坏；项字段不全。
+    跳过条件：与已有内置或用户预设同名；JSON 损坏；项字段不全；
+    kind/ext 非法。自由文本 ffmpeg 参数（extra_args 等）会被安全剔除。
     """
     try:
         data = json.loads(Path(path).read_text("utf-8"))
@@ -261,6 +287,7 @@ def import_presets(path: str) -> tuple[int, list[str]]:
     if not isinstance(data, list):
         raise ValueError("文件格式错误：根节点应为预设列表")
 
+    from . import formats as F  # 延迟导入避免环
     existing = {p.name for p in BUILTIN} | {p.name for p in load_user_presets()}
     accepted: list[Preset] = []
     skipped: list[str] = []
@@ -277,9 +304,17 @@ def import_presets(path: str) -> tuple[int, list[str]]:
         except KeyError:
             skipped.append(str(item.get("name", "?")))
             continue
+        # 校验 kind/ext 合法性，非法预设静默存在但永不显示没有意义
+        if kind not in _VALID_KINDS or not F.find_format(ext, kind):
+            skipped.append(f"{name}（类别/格式非法）")
+            continue
         if name in existing:
             skipped.append(name)
             continue
+        dropped: list[str] = []
+        params = _sanitize_import_params(params, dropped)
+        if dropped:
+            desc = (desc + " " if desc else "") + f"[导入时已剔除：{', '.join(dropped)}]"
         accepted.append(Preset(name=name, kind=kind, ext=ext,
                                params=params, description=desc))
         existing.add(name)

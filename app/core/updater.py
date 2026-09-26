@@ -9,6 +9,7 @@
 from __future__ import annotations
 
 import json
+import hashlib
 import os
 import re
 import subprocess
@@ -43,6 +44,7 @@ class UpdateInfo:
     asset_name: str             # 安装包文件名
     html_url: str               # GitHub Release 页面地址
     published_at: str           # 发布时间（ISO8601）
+    sha256_url: str = ""        # SHA-256 checksum 文件直链（可选）
 
     def summary(self, max_chars: int = 600) -> str:
         """去掉 Markdown 标记的前若干字符，供对话框显示。"""
@@ -128,6 +130,14 @@ def check_for_update(current: str, *,
     if not asset:
         return None
 
+    # 尝试找配套的 SHA-256 校验文件（MediaForge-*-Setup.exe.sha256）
+    sha256_url = ""
+    sha_asset = next((a for a in rel.get("assets", [])
+                      if a.get("name", "").lower() == (asset.get("name", "") + ".sha256").lower()),
+                     None)
+    if sha_asset:
+        sha256_url = sha_asset.get("browser_download_url", "")
+
     return UpdateInfo(
         version=".".join(str(x) for x in new_v),
         name=rel.get("name") or tag,
@@ -135,6 +145,7 @@ def check_for_update(current: str, *,
         asset_url=asset.get("browser_download_url", ""),
         asset_size=int(asset.get("size") or 0),
         asset_name=asset.get("name", ""),
+        sha256_url=sha256_url,
         html_url=rel.get("html_url", ""),
         published_at=rel.get("published_at", ""),
     )
@@ -151,31 +162,46 @@ def download(url: str, dest: str, *,
              timeout: float = 30.0,
              on_progress: ProgressCB | None = None,
              cancel: CancelCheck | None = None,
+             expected_sha256: str = "",
              chunk: int = 64 * 1024) -> str:
     """流式下载 url 到 dest（带进度回调，可取消）。返回 dest 路径。
 
+    expected_sha256 非空时校验下载内容的 SHA-256，不匹配抛 ValueError。
     失败抛 urllib.error.URLError / OSError，由调用方处理。
+    取消/失败时清理 .part 临时文件。
     """
     req = urllib.request.Request(url, headers={
         "User-Agent": "MediaForge-Updater/1.0",
     })
-    with urllib.request.urlopen(req, timeout=timeout) as resp:
-        total = int(resp.headers.get("Content-Length") or 0)
-        done = 0
-        # 原子写入：先下载到同目录的 .part，再 rename
-        tmp = dest + ".part"
-        with open(tmp, "wb") as f:
-            while True:
-                if cancel and cancel():
-                    raise _Canceled("用户取消下载")
-                block = resp.read(chunk)
-                if not block:
-                    break
-                f.write(block)
-                done += len(block)
-                if on_progress:
-                    on_progress(done, total)
-    os.replace(tmp, dest)
+    tmp = dest + ".part"
+    try:
+        with urllib.request.urlopen(req, timeout=timeout) as resp:
+            total = int(resp.headers.get("Content-Length") or 0)
+            done = 0
+            hasher = hashlib.sha256() if expected_sha256 else None
+            # 原子写入：先下载到同目录的 .part，再 rename
+            with open(tmp, "wb") as f:
+                while True:
+                    if cancel and cancel():
+                        raise _Canceled("用户取消下载")
+                    block = resp.read(chunk)
+                    if not block:
+                        break
+                    f.write(block)
+                    if hasher:
+                        hasher.update(block)
+                    done += len(block)
+                    if on_progress:
+                        on_progress(done, total)
+        if hasher and hasher.hexdigest().lower() != expected_sha256.lower():
+            raise ValueError("下载文件校验失败（SHA-256 不匹配），已拒绝安装")
+        os.replace(tmp, dest)
+    except BaseException:
+        try:
+            os.remove(tmp)
+        except OSError:
+            pass
+        raise
     return dest
 
 
@@ -185,12 +211,17 @@ class _Canceled(Exception):
 
 def download_update(info: UpdateInfo, *,
                     on_progress: ProgressCB | None = None,
-                    cancel: CancelCheck | None = None) -> str:
-    """把 UpdateInfo 指向的安装包下载到系统临时目录，返回本地路径。"""
+                    cancel: CancelCheck | None = None,
+                    expected_sha256: str = "") -> str:
+    """把 UpdateInfo 指向的安装包下载到系统临时目录，返回本地路径。
+
+    expected_sha256 非空时启用完整性校验。
+    """
     suffix = "_" + re.sub(r"[^\w.-]", "_", info.asset_name or "installer.exe")
     dest = os.path.join(tempfile.gettempdir(), f"MediaForgeUpdate{suffix}")
     return download(info.asset_url, dest,
-                    on_progress=on_progress, cancel=cancel)
+                    on_progress=on_progress, cancel=cancel,
+                    expected_sha256=expected_sha256)
 
 
 def launch_installer_and_exit(installer_path: str) -> None:
@@ -218,9 +249,10 @@ def launch_installer_and_exit(installer_path: str) -> None:
     except OSError:
         # 启动失败也照常退出——用户可手动重试
         pass
-    # 给安装器一点时间识别 mutex，再退出
+    # 给安装器一点时间识别 mutex，再退出。
+    # 用 os._exit(0) 避免在 Qt 槽中抛出 SystemExit 不可靠的问题。
     time.sleep(0.5)
-    sys.exit(0)
+    os._exit(0)
 
 
 __all__ = [

@@ -18,7 +18,9 @@ try:  # 可选：AVIF / HEIF 支持
 except ImportError:  # pragma: no cover
     HEIF_OK = False
 
-Image.MAX_IMAGE_PIXELS = None
+# 解压炸弹防护：限制单张图片最大像素（约 5 亿像素，覆盖 32K 全景图），
+# 防止恶意/损坏图片耗尽内存。Pillow 默认 1.78 亿，这里放宽到 5 亿。
+Image.MAX_IMAGE_PIXELS = 500_000_000
 
 RESAMPLE = {
     "nearest": Image.Resampling.NEAREST,
@@ -218,8 +220,8 @@ def convert_image(src: str, dst: str, params: dict[str, Any],
     fmt = SAVE_FORMAT.get(ext)
     if not fmt:
         raise ValueError(f"不支持的图片输出格式：.{ext}")
-    if fmt in ("AVIF", "HEIF") and not HEIF_OK and fmt == "HEIF":
-        raise RuntimeError("当前环境缺少 HEIF 支持（pillow-heif 未安装）")
+    if fmt in ("AVIF", "HEIF") and not HEIF_OK:
+        raise RuntimeError(f"当前环境缺少 {fmt} 支持（pillow-heif 未安装）")
 
     _check_cancel(cancel)
     with Image.open(src) as im:
@@ -259,11 +261,16 @@ def convert_image(src: str, dst: str, params: dict[str, Any],
 def _convert_animated(im: Image.Image, dst: str, fmt: str,
                       params: dict[str, Any], n_frames: int,
                       cancel: Any = None) -> str:
-    """处理 GIF / 动态 WebP / APNG 多帧图。"""
+    """处理 GIF / 动态 WebP / APNG 多帧图。
+
+    GIF 使用全局调色板（以首帧为基准量化，后续帧共享），避免逐帧独立
+    量化导致的闪烁/色偏；同时逐帧转为 P 模式存储，内存占用降为 RGBA 的 1/4。
+    """
     from PIL import ImageSequence
 
     frames: list[Image.Image] = []
     durations: list[int] = []
+    palette_img: Image.Image | None = None
     for i, frame in enumerate(ImageSequence.Iterator(im)):
         if i % 5 == 0:
             _check_cancel(cancel)
@@ -272,13 +279,16 @@ def _convert_animated(im: Image.Image, dst: str, fmt: str,
         f = _apply_adjustments(f, params, cancel)
         if fmt in NO_ALPHA:
             f = _flatten(f, _s(params, "background", "#FFFFFF"))
+        if fmt == "GIF":
+            if palette_img is None:
+                palette_img = f.convert("P", palette=Image.Palette.ADAPTIVE)
+                f = palette_img
+            else:
+                f = f.quantize(palette=palette_img, dither=Image.Dither.FLOYDSTEINBERG)
         frames.append(f)
         durations.append(frame.info.get("duration", 100))
 
     first, rest = frames[0], frames[1:]
-    if fmt == "GIF":
-        first = first.convert("P", palette=Image.Palette.ADAPTIVE)
-        rest = [f.convert("P", palette=Image.Palette.ADAPTIVE) for f in rest]
 
     _check_cancel(cancel)
     os.makedirs(os.path.dirname(os.path.abspath(dst)) or ".", exist_ok=True)

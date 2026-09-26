@@ -59,10 +59,19 @@ class _DownloadTask(QRunnable):
 
     def run(self) -> None:
         try:
+            # 有配套 .sha256 资产时先拉取校验值，下载时做完整性校验
+            expected = ""
+            if self.info.sha256_url:
+                try:
+                    raw = updater._http_get(self.info.sha256_url, timeout=10)
+                    expected = raw.decode("utf-8", errors="replace").split()[0].strip()
+                except Exception:  # noqa: BLE001
+                    expected = ""
             path = updater.download_update(
                 self.info,
                 on_progress=lambda d, t: self.bridge.progress.emit(d, t),
                 cancel=lambda: self.cancel.is_set(),
+                expected_sha256=expected,
             )
             self.bridge.done.emit(path)
         except Exception as exc:  # noqa: BLE001

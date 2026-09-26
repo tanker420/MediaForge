@@ -505,7 +505,10 @@ def build_command(src: str, dst: str, params: dict[str, Any],
     # ---- 字幕 / 章节 / 元数据 ----
     sub_mode = "none" if pass_no == 1 else _s(params, "subtitle_mode", "copy")
     if kind == F.VIDEO and sub_mode == "copy" and out_ext in ("mkv", "mp4", "mov", "webm"):
-        cmd += ["-c:s", "copy" if out_ext == "mkv" else "mov_text", "-map", "0", "-map", "-0:d?"]
+        # 排除数据流(-0:d)与附件流(-0:t)，避免 MKV 内嵌字体附件导致
+        # mov_text 转换失败、整个任务报错
+        cmd += ["-c:s", "copy" if out_ext == "mkv" else "mov_text",
+                "-map", "0", "-map", "-0:d?", "-map", "-0:t?"]
     elif sub_mode in ("none", "burn"):
         cmd += ["-sn"]
 
@@ -548,14 +551,21 @@ def _null_is_nul() -> bool:
 
 
 def needs_two_pass(params: dict[str, Any]) -> bool:
+    vc = _s(params, "video_codec", "")
+    # 硬件编码器不支持 -pass 参数，两遍编码会失败
+    hw_encs = {"h264_nvenc", "hevc_nvenc", "av1_nvenc",
+               "h264_qsv", "hevc_qsv", "av1_qsv",
+               "h264_amf", "hevc_amf", "av1_amf"}
     return _b(params, "two_pass") and bool(_s(params, "bitrate")) \
-        and _s(params, "video_codec") != "copy"
+        and vc != "copy" and vc not in hw_encs
 
 
-def preview_command(src: str, dst: str, params: dict[str, Any]) -> str:
-    """给 UI 展示的可读命令行。"""
+def preview_command(src: str, dst: str, params: dict[str, Any],
+                    info: Any = None) -> str:
+    """给 UI 展示的可读命令行。传入 info 时与实际执行命令完全一致
+    （含音频淡出等依赖媒体时长的滤镜）。"""
     try:
-        cmd = build_command(src, dst, params)
+        cmd = build_command(src, dst, params, info)
     except Exception as exc:  # noqa: BLE001
         return f"（无法生成命令：{exc}）"
     return " ".join(shlex.quote(c) for c in cmd)

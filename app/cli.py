@@ -20,7 +20,7 @@ from .core import formats as F
 from .core import presets as P
 from .core.converter import ConversionQueue, Job, Status
 from .core.ffmpeg_builder import preview_command
-from .core.ffprobe import ffmpeg_path, ffmpeg_version, invalidate_caches
+from .core.ffprobe import ffmpeg_path, ffmpeg_version, invalidate_caches, probe
 from .core.naming import build_output_path, collect_files, dedupe
 
 __version__ = __import__("app").__version__
@@ -198,7 +198,11 @@ def _run(args: argparse.Namespace) -> int:
         for j in jobs:
             print(f"\n{j.src}\n  -> {j.dst}")
             try:
-                print("  " + preview_command(j.src, j.dst, j.params))
+                j.info = probe(j.src)
+            except Exception:  # noqa: BLE001
+                pass
+            try:
+                print("  " + preview_command(j.src, j.dst, j.params, j.info))
             except Exception as exc:  # noqa: BLE001
                 print(f"  （无法生成命令：{exc}）")
         return 0

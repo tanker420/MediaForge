@@ -105,8 +105,9 @@ def collect_files(paths: list[str], recursive: bool = True,
                     if not os.path.isfile(full):
                         continue
                     if exts:
-                        e = f.rsplit(".", 1)[-1].lower() if "." in f else ""
-                        if e not in exts:
+                        # 用 formats.input_ext 统一处理复合扩展名（mp.jpg 等）
+                        from . import formats as F
+                        if F.input_ext(f) not in exts:
                             continue
                     out.append(os.path.abspath(full))
     seen, uniq = set(), []
