@@ -22,6 +22,7 @@
     <string name="ready">就绪</string>
     <string name="theme_toggle">深色</string>
     <string name="theme_toggle_night">浅色</string>
+    <string name="update_check">检查更新</string>
     <string name="need_storage">需要「所有文件访问」权限才能读取和写出媒体文件</string>
     <string name="no_files">请先添加要转换的文件</string>
     <string name="drop_hint">点击「添加文件」选择要转换的媒体文件</string>

@@ -66,6 +66,7 @@ class MainActivity : AppCompatActivity() {
     private lateinit var lblVcodec: TextView
     private lateinit var lblAcodec: TextView
     private lateinit var lblEmpty: TextView
+    private lateinit var btnUpdate: MaterialButton
     private var presetPool: List<Preset> = emptyList()
 
     private val PATTERNS = listOf("{name}" to "原文件名", "{name}_converted" to "原文件名_converted",
@@ -97,6 +98,10 @@ class MainActivity : AppCompatActivity() {
 
         findViewById<View>(R.id.btn_theme).setOnClickListener { toggleTheme() }
         refreshThemeButton()
+
+        btnUpdate = findViewById(R.id.btn_update)
+        btnUpdate.setOnClickListener { checkUpdate(manual = true) }
+        maybeCheckUpdate()
 
         // 选项卡颜色从 Material 主题令牌取，深浅色自动跟随
         findViewById<TabLayout>(R.id.tabs).let {
@@ -269,6 +274,102 @@ class MainActivity : AppCompatActivity() {
                 startActivity(Intent(android.provider.Settings.ACTION_MANAGE_ALL_FILES_ACCESS_PERMISSION))
             }
         }
+    }
+
+    // ---------------- 检查更新 ----------------
+    private fun currentVersion(): String = runCatching {
+        packageManager.getPackageInfo(packageName, 0).versionName ?: "0.0.0"
+    }.getOrDefault("0.0.0")
+
+    /** 启动后静默检查更新，24 小时内不重复联网。 */
+    private fun maybeCheckUpdate() {
+        val last = prefs.getLong("last_update_check", 0L)
+        if (System.currentTimeMillis() - last < 24L * 60 * 60 * 1000) return
+        checkUpdate(manual = false)
+    }
+
+    private fun checkUpdate(manual: Boolean) {
+        prefs.edit().putLong("last_update_check", System.currentTimeMillis()).apply()
+        val cur = currentVersion()
+        Thread {
+            val info = Updater.checkForUpdate(cur)
+            runOnUiThread {
+                if (info == null) {
+                    if (manual) Toast.makeText(this, "已是最新版本", Toast.LENGTH_SHORT).show()
+                    return@runOnUiThread
+                }
+                showUpdateDialog(info, cur)
+            }
+        }.start()
+    }
+
+    private fun showUpdateDialog(info: UpdateInfo, current: String) {
+        val body = stripMarkdown(info.body).trim().ifBlank { "（无更新说明）" }
+        AlertDialog.Builder(this)
+            .setTitle("发现新版本 v${info.version}")
+            .setMessage("当前版本：v$current\n\n${body.take(600)}")
+            .setPositiveButton("立即更新") { _, _ -> startDownload(info) }
+            .setNeutralButton("打开发布页") { _, _ -> openInBrowser(info.htmlUrl) }
+            .setNegativeButton("稍后再说", null)
+            .show()
+    }
+
+    /** 极简 Markdown → 纯文本（与桌面 updater.summary 一致，供对话框展示）。 */
+    private fun stripMarkdown(s: String): String =
+        s.replace(Regex("!\\[[^\\]]*\\]\\([^)]*\\)"), "")
+            .replace(Regex("\\[([^\\]]+)\\]\\([^)]*\\)"), "$1")
+            .replace(Regex("`([^`]*)`"), "$1")
+            .replace(Regex("(?m)^#{1,6}\\s+"), "")
+            .replace(Regex("(?m)^\\s*[-*+]\\s+"), "• ")
+            .replace(Regex("\\*\\*([^*]+)\\*\\*"), "$1")
+            .replace(Regex("\\*([^*]+)\\*"), "$1")
+            .replace(Regex("~~([^~]+)~~"), "$1")
+
+    private fun openInBrowser(url: String) {
+        if (url.isEmpty()) return
+        runCatching { startActivity(Intent(Intent.ACTION_VIEW, Uri.parse(url))) }
+    }
+
+    private fun startDownload(info: UpdateInfo) {
+        val lbl = TextView(this).apply {
+            text = "0%"
+            textSize = 12f
+            setPadding(0, dp(8), 0, dp(6))
+        }
+        val bar = ProgressBar(this, null, android.R.attr.progressBarStyleHorizontal).apply {
+            max = 100
+            progress = 0
+        }
+        val box = LinearLayout(this).apply {
+            orientation = LinearLayout.VERTICAL
+            setPadding(dp(20), dp(10), dp(20), 0)
+            addView(lbl)
+            addView(bar)
+        }
+        val dlg = AlertDialog.Builder(this)
+            .setTitle("正在下载 v${info.version}")
+            .setView(box)
+            .setCancelable(false)
+            .create()
+        dlg.show()
+
+        Thread {
+            val file = Updater.download(this, info) { done, total ->
+                runOnUiThread {
+                    val pct = if (total > 0) (done * 100 / total).toInt().coerceIn(0, 100) else 0
+                    bar.progress = pct
+                    lbl.text = if (total > 0) "$pct%" else "${done / 1024} KB"
+                }
+            }
+            runOnUiThread {
+                dlg.dismiss()
+                if (file == null) {
+                    Toast.makeText(this, "下载失败，请稍后重试", Toast.LENGTH_LONG).show()
+                } else {
+                    Updater.installApk(this, file)
+                }
+            }
+        }.start()
     }
 
     // ---------------- 类别 / 格式 ----------------
