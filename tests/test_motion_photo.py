@@ -51,13 +51,22 @@ def test_motion_photo_and_animated_presets():
 # ---------------- XMP 构建 ----------------
 def test_build_xmp_contains_required_tags():
     xmp = MP.build_xmp(12345, 1000000)
-    assert 'Camera:MotionPhoto="1"' in xmp
-    assert 'Camera:MotionPhotoVersion="1"' in xmp
-    assert 'Camera:MotionPhotoPresentationTimestampUs="1000000"' in xmp
+    assert 'GCamera:MotionPhoto="1"' in xmp
+    assert 'GCamera:MotionPhotoVersion="1"' in xmp
+    assert 'GCamera:MotionPhotoPresentationTimestampUs="1000000"' in xmp
     assert 'Item:Mime="video/mp4"' in xmp
     assert 'Item:Semantic="MotionPhoto"' in xmp
     assert 'Item:Length="12345"' in xmp
     assert 'Item:Mime="image/jpeg"' in xmp
+    assert 'Item:Semantic="Primary"' in xmp
+    assert 'Item:Padding="0"' in xmp
+    assert 'rdf:about=""' in xmp
+    # OPPO ColorOS 相册识别的扩展字段
+    assert 'xmlns:OpCamera="http://ns.oplus.com/photos/1.0/camera/"' in xmp
+    assert 'OpCamera:MotionPhotoOwner="oplus"' in xmp
+    assert 'OpCamera:OLivePhotoVersion="2"' in xmp
+    assert 'OpCamera:MotionPhotoPrimaryPresentationTimestampUs="1000000"' in xmp
+    assert 'OpCamera:VideoLength="12345"' in xmp
 
 
 def test_make_xmp_segment_and_inject():

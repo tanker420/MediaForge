@@ -17,19 +17,28 @@ object MotionPhoto {
     private const val XMP_IDENT = "http://ns.adobe.com/xap/1.0/\u0000"
 
     fun buildXmp(mp4Size: Int, presentationTimestampUs: Long): String =
-        "<x:xmpmeta xmlns:x=\"adobe:ns:meta/\">" +
-            "<rdf:RDF xmlns:rdf=\"http://www.w3.org/1999/02/22-rdf-syntax-ns#\"" +
-            " xmlns:Camera=\"http://ns.google.com/photos/1.0/camera/\"" +
+        // 严格对齐 Google MotionPhotoMuxer 规范，并追加 OPPO ColorOS 相册识别的
+        // OpCamera 扩展字段。OPPO 系统相册只认自家格式，缺 MotionPhotoOwner=oplus
+        // / OLivePhotoVersion=2 会被当作静态图，无法播放。
+        "<x:xmpmeta xmlns:x=\"adobe:ns:meta/\" x:xmptk=\"XMP Core 5.1.2\">" +
+            "<rdf:RDF xmlns:rdf=\"http://www.w3.org/1999/02/22-rdf-syntax-ns#\">" +
+            "<rdf:Description rdf:about=\"\"" +
+            " xmlns:GCamera=\"http://ns.google.com/photos/1.0/camera/\"" +
+            " xmlns:OpCamera=\"http://ns.oplus.com/photos/1.0/camera/\"" +
             " xmlns:Container=\"http://ns.google.com/photos/1.0/container/\"" +
-            " xmlns:Item=\"http://ns.google.com/photos/1.0/container/item/\">" +
-            "<rdf:Description Camera:MotionPhoto=\"1\" Camera:MotionPhotoVersion=\"1\"" +
-            " Camera:MotionPhotoPresentationTimestampUs=\"$presentationTimestampUs\">" +
+            " xmlns:Item=\"http://ns.google.com/photos/1.0/container/item/\"" +
+            " GCamera:MotionPhoto=\"1\" GCamera:MotionPhotoVersion=\"1\"" +
+            " GCamera:MotionPhotoPresentationTimestampUs=\"$presentationTimestampUs\"" +
+            " OpCamera:MotionPhotoOwner=\"oplus\" OpCamera:OLivePhotoVersion=\"2\"" +
+            " OpCamera:MotionPhotoPrimaryPresentationTimestampUs=\"$presentationTimestampUs\"" +
+            " OpCamera:VideoLength=\"$mp4Size\">" +
             "<Container:Directory><rdf:Seq>" +
             "<rdf:li rdf:parseType=\"Resource\"><Container:Item" +
-            " Item:Mime=\"image/jpeg\" Item:Semantic=\"Primary\"/></rdf:li>" +
+            " Item:Mime=\"image/jpeg\" Item:Semantic=\"Primary\"" +
+            " Item:Length=\"0\" Item:Padding=\"0\"/></rdf:li>" +
             "<rdf:li rdf:parseType=\"Resource\"><Container:Item" +
             " Item:Mime=\"video/mp4\" Item:Semantic=\"MotionPhoto\"" +
-            " Item:Length=\"$mp4Size\"/></rdf:li>" +
+            " Item:Length=\"$mp4Size\" Item:Padding=\"0\"/></rdf:li>" +
             "</rdf:Seq></Container:Directory>" +
             "</rdf:Description></rdf:RDF></x:xmpmeta>"
 
