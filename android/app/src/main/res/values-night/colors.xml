@@ -11,4 +11,5 @@
     <color name="app_card">#1C1C1E</color>
     <color name="app_fill">#2C2C2E</color>
     <color name="app_hairline">#1FFFFFFF</color>
+    <color name="app_card_stroke">#26FFFFFF</color>
 </resources>

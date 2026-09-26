@@ -42,4 +42,8 @@
     <string name="preset_empty">暂无用户预设。先调好参数，再点「存当前为预设」。</string>
     <string name="parallel_tasks">并行任务</string>
     <string name="custom_pattern_hint">自定义规则，可用变量：{name} {ext} {date} {time} {index} {parent}</string>
+    <string name="overwrite_switch">覆盖同名文件</string>
+    <string name="menu_theme">切换主题</string>
+    <string name="menu_update">检查更新</string>
+    <string name="menu_about">关于</string>
 </resources>

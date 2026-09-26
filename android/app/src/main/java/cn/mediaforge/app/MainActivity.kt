@@ -12,11 +12,7 @@ import android.view.View
 import android.view.ViewGroup
 import android.widget.AdapterView
 import android.widget.ArrayAdapter
-import android.widget.BaseAdapter
-import android.widget.CheckBox
-import android.widget.EditText
 import android.widget.LinearLayout
-import android.widget.ListView
 import android.widget.ProgressBar
 import android.widget.SeekBar
 import android.widget.Spinner
@@ -28,8 +24,12 @@ import androidx.appcompat.app.AppCompatDelegate
 import androidx.core.view.ViewCompat
 import androidx.core.view.WindowCompat
 import androidx.core.view.WindowInsetsCompat
+import androidx.recyclerview.widget.LinearLayoutManager
+import androidx.recyclerview.widget.RecyclerView
+import com.google.android.material.appbar.MaterialToolbar
 import com.google.android.material.button.MaterialButton
 import com.google.android.material.color.MaterialColors
+import com.google.android.material.materialswitch.MaterialSwitch
 import com.google.android.material.tabs.TabLayout
 import java.io.File
 import java.text.SimpleDateFormat
@@ -41,24 +41,24 @@ class MainActivity : AppCompatActivity() {
     private lateinit var prefs: SharedPreferences
     private var kind = Formats.VIDEO
     private val files = mutableListOf<String>()
-    private val checked = mutableSetOf<String>()
     private val rowStatus = mutableMapOf<String, String>()
+    private val rowProgress = mutableMapOf<String, Int>()
     private var outDir = ""
     private var busy = false
     private var encoders: Set<String> = emptySet()
 
-    private lateinit var fileList: ListView
+    private lateinit var fileList: RecyclerView
     private lateinit var adapter: FileAdapter
     private lateinit var spFmt: Spinner
     private lateinit var spVcodec: Spinner
     private lateinit var spAcodec: Spinner
     private lateinit var spPattern: Spinner
     private lateinit var spPreset: Spinner
-    private lateinit var edPattern: EditText
+    private lateinit var edPattern: android.widget.EditText
     private lateinit var skWorkers: SeekBar
     private lateinit var lblWorkers: TextView
     private lateinit var form: ParamForm
-    private lateinit var edOutdir: EditText
+    private lateinit var edOutdir: android.widget.EditText
     private lateinit var progress: ProgressBar
     private lateinit var lblStatus: TextView
     private lateinit var btnStart: MaterialButton
@@ -66,7 +66,7 @@ class MainActivity : AppCompatActivity() {
     private lateinit var lblVcodec: TextView
     private lateinit var lblAcodec: TextView
     private lateinit var lblEmpty: TextView
-    private lateinit var btnUpdate: MaterialButton
+    private lateinit var chkOverwrite: MaterialSwitch
     private var presetPool: List<Preset> = emptyList()
 
     private val PATTERNS = listOf("{name}" to "原文件名", "{name}_converted" to "原文件名_converted",
@@ -79,15 +79,31 @@ class MainActivity : AppCompatActivity() {
         WindowCompat.setDecorFitsSystemWindows(window, false)
         setContentView(R.layout.activity_main)
 
-        // 状态栏 / 导航栏内边距：头部与底栏各自吃掉对应 inset
-        val header = findViewById<View>(R.id.app_header)
-        val headerTop = header.paddingTop
-        ViewCompat.setOnApplyWindowInsetsListener(header) { v, insets ->
-            v.setPadding(v.paddingLeft,
-                headerTop + insets.getInsets(WindowInsetsCompat.Type.statusBars()).top,
-                v.paddingRight, v.paddingBottom)
-            insets
+        // 工具栏
+        val toolbar = findViewById<MaterialToolbar>(R.id.toolbar)
+        setSupportActionBar(toolbar)
+        toolbar.inflateMenu(R.menu.main_menu)
+        toolbar.setOnMenuItemClickListener { item ->
+            when (item.itemId) {
+                R.id.action_theme -> { toggleTheme(); true }
+                R.id.action_update -> { checkUpdate(manual = true); true }
+                R.id.action_about -> { showAbout(); true }
+                else -> false
+            }
         }
+
+        // 状态栏内边距给 AppBar
+        val appBar = findViewById<View>(R.id.toolbar).parent as? View
+        appBar?.let {
+            val top = it.paddingTop
+            ViewCompat.setOnApplyWindowInsetsListener(it) { v, insets ->
+                v.setPadding(v.paddingLeft,
+                    top + insets.getInsets(WindowInsetsCompat.Type.statusBars()).top,
+                    v.paddingRight, v.paddingBottom)
+                insets
+            }
+        }
+        // 底栏吃导航栏 inset
         val footer = findViewById<View>(R.id.footer_bar)
         val footerBottom = footer.paddingBottom
         ViewCompat.setOnApplyWindowInsetsListener(footer) { v, insets ->
@@ -96,14 +112,6 @@ class MainActivity : AppCompatActivity() {
             insets
         }
 
-        findViewById<View>(R.id.btn_theme).setOnClickListener { toggleTheme() }
-        refreshThemeButton()
-
-        btnUpdate = findViewById(R.id.btn_update)
-        btnUpdate.setOnClickListener { checkUpdate(manual = true) }
-        maybeCheckUpdate()
-
-        // 选项卡颜色从 Material 主题令牌取，深浅色自动跟随
         findViewById<TabLayout>(R.id.tabs).let {
             it.setBackgroundColor(MaterialColors.getColor(
                 it, com.google.android.material.R.attr.colorSurface))
@@ -132,14 +140,25 @@ class MainActivity : AppCompatActivity() {
         lblVcodec = findViewById(R.id.lbl_vcodec)
         lblAcodec = findViewById(R.id.lbl_acodec)
         lblEmpty = findViewById(R.id.lbl_empty)
+        chkOverwrite = findViewById(R.id.chk_overwrite)
 
-        adapter = FileAdapter()
+        // RecyclerView 文件列表
+        adapter = FileAdapter(
+            onToggle = { path, checked ->
+                if (checked) adapterCheckedAdd(path) else adapterCheckedRemove(path)
+            },
+            onClick = { /* 预留：点击条目可弹出详情/移除 */ }
+        )
+        fileList.layoutManager = LinearLayoutManager(this)
         fileList.adapter = adapter
 
-        findViewById<MaterialButton>(R.id.btn_add).setOnClickListener { pickFiles() }
+        findViewById<com.google.android.material.floatingactionbutton.FloatingActionButton>(
+            R.id.btn_add).setOnClickListener { pickFiles() }
         findViewById<MaterialButton>(R.id.btn_remove).setOnClickListener { removeSelected() }
         findViewById<MaterialButton>(R.id.btn_clear).setOnClickListener {
-            files.clear(); checked.clear(); rowStatus.clear(); refreshFileList(); updateCount()
+            files.clear(); adapter.setChecked(emptySet())
+            rowStatus.clear(); rowProgress.clear()
+            submitList(); updateCount()
         }
         findViewById<MaterialButton>(R.id.btn_browse).setOnClickListener { pickOutDir() }
         btnStart.setOnClickListener { start() }
@@ -171,7 +190,7 @@ class MainActivity : AppCompatActivity() {
         spPreset.onItemSelectedListener = sel { onPresetSelected() }
         findViewById<MaterialButton>(R.id.btn_presets).setOnClickListener { openPresetManager() }
 
-        // 命名规则：内置默认选项 + 自定义…
+        // 命名规则
         spPattern.adapter = ArrayAdapter(this, android.R.layout.simple_spinner_item,
             PATTERNS.map { it.second } + getString(R.string.custom_option))
         spPattern.onItemSelectedListener = sel {
@@ -187,7 +206,7 @@ class MainActivity : AppCompatActivity() {
             edPattern.visibility = View.VISIBLE
         }
 
-        // 并行任务：滑块 1~8（防呆：SeekBar 天然限定范围）
+        // 并行任务滑块
         skWorkers.progress = (prefs.getInt("workers", 2) - 1).coerceIn(0, 7)
         lblWorkers.text = (skWorkers.progress + 1).toString()
         skWorkers.setOnSeekBarChangeListener(object : SeekBar.OnSeekBarChangeListener {
@@ -199,29 +218,37 @@ class MainActivity : AppCompatActivity() {
             override fun onStopTrackingTouch(s: SeekBar?) {}
         })
 
+        chkOverwrite.isChecked = prefs.getBoolean("overwrite", true)
+        chkOverwrite.setOnCheckedChangeListener { _, v ->
+            prefs.edit().putBoolean("overwrite", v).apply()
+        }
+
         outDir = prefs.getString("out_dir", "") ?: ""
         edOutdir.setText(outDir)
 
         ensureStorage()
         applyKind(Formats.VIDEO)
-        refreshFileList()
+        submitList()
 
         Converter.listener = object : Converter.Listener {
             override fun onProgress(job: Job, p: Float, speed: String) {
                 runOnUiThread {
-                    rowStatus[job.src] = "${(p * 100).toInt()}%"
-                    adapter.notifyDataSetChanged()
-                    progress.progress = (p * 100).toInt()
-                    lblStatus.text = "${File(job.src).name} ${(p * 100).toInt()}%"
+                    val pct = (p * 100).toInt()
+                    rowStatus[job.src] = "$pct%"
+                    rowProgress[job.src] = pct
+                    updateItem(job.src)
+                    progress.progress = pct
+                    lblStatus.text = "${File(job.src).name} $pct%"
                 }
             }
 
             override fun onJobDone(job: Job, ok: Boolean, message: String) {
                 runOnUiThread {
                     rowStatus[job.src] = if (ok) "完成" else "失败"
+                    rowProgress[job.src] = if (ok) 100 else -1
+                    updateItem(job.src)
                     if (!ok && message.isNotEmpty()) Toast.makeText(this@MainActivity,
                         "${File(job.src).name}: ${message.take(200)}", Toast.LENGTH_LONG).show()
-                    adapter.notifyDataSetChanged()
                 }
             }
 
@@ -240,6 +267,8 @@ class MainActivity : AppCompatActivity() {
             encoders = Converter.availableEncoders()
             runOnUiThread { rebuildCodecsAndForm() }
         }.start()
+
+        maybeCheckUpdate()
     }
 
     private fun sel(fn: () -> Unit) = object : AdapterView.OnItemSelectedListener {
@@ -257,13 +286,15 @@ class MainActivity : AppCompatActivity() {
     private fun toggleTheme() {
         val dark = !prefs.getBoolean("ui_dark", false)
         prefs.edit().putBoolean("ui_dark", dark).apply()
-        applyThemeFromPrefs()   // 触发重建，立即生效
+        applyThemeFromPrefs()
     }
 
-    private fun refreshThemeButton() {
-        findViewById<MaterialButton>(R.id.btn_theme).text =
-            if (prefs.getBoolean("ui_dark", false))
-                getString(R.string.theme_toggle_night) else getString(R.string.theme_toggle)
+    private fun showAbout() {
+        AlertDialog.Builder(this)
+            .setTitle(R.string.app_name)
+            .setMessage("v${currentVersion()}\n\n媒体格式批量转换工具\n基于 FFmpeg Kit\n\nhttps://github.com/tanker420/MediaForge")
+            .setPositiveButton("确定", null)
+            .show()
     }
 
     // ---------------- 存储权限 ----------------
@@ -281,7 +312,6 @@ class MainActivity : AppCompatActivity() {
         packageManager.getPackageInfo(packageName, 0).versionName ?: "0.0.0"
     }.getOrDefault("0.0.0")
 
-    /** 启动后静默检查更新，24 小时内不重复联网。 */
     private fun maybeCheckUpdate() {
         val last = prefs.getLong("last_update_check", 0L)
         if (System.currentTimeMillis() - last < 24L * 60 * 60 * 1000) return
@@ -314,7 +344,6 @@ class MainActivity : AppCompatActivity() {
             .show()
     }
 
-    /** 极简 Markdown → 纯文本（与桌面 updater.summary 一致，供对话框展示）。 */
     private fun stripMarkdown(s: String): String =
         s.replace(Regex("!\\[[^\\]]*\\]\\([^)]*\\)"), "")
             .replace(Regex("\\[([^\\]]+)\\]\\([^)]*\\)"), "$1")
@@ -380,7 +409,7 @@ class MainActivity : AppCompatActivity() {
             fmts.map { "${it.label}  (.${it.ext})" })
         refreshPresetSpinner()
         rebuildCodecsAndForm()
-        adapter.notifyDataSetChanged()
+        submitList()
     }
 
     // ---------------- 预设 ----------------
@@ -402,7 +431,6 @@ class MainActivity : AppCompatActivity() {
         applyPreset(p)
     }
 
-    /** 套用预设：先切格式/编码器（异步重建表单），再回填参数。 */
     private fun applyPreset(p: Preset) {
         val fi = Formats.formatsFor(kind).indexOfFirst { it.ext == p.ext }
         if (fi >= 0) spFmt.setSelection(fi)
@@ -423,7 +451,6 @@ class MainActivity : AppCompatActivity() {
         }
     }
 
-    /** 当前界面参数汇总成可保存的预设参数（含格式与编码器）。 */
     private fun makeCurrentPresetParams(): MutableMap<String, Any?> {
         val p = collectParams()
         p.remove("overwrite")
@@ -461,7 +488,9 @@ class MainActivity : AppCompatActivity() {
     private fun formParams(): List<Param> {
         if (kind == Formats.IMAGE) return Formats.IMAGE_PARAMS
         val fmt = currentFormat()
-        val params = Formats.GENERAL_PARAMS + Formats.VIDEO_FILTER_PARAMS + Formats.AUDIO_FILTER_PARAMS
+        val filters = if (kind == Formats.AUDIO) Formats.AUDIO_FILTER_PARAMS
+        else Formats.VIDEO_FILTER_PARAMS + Formats.AUDIO_FILTER_PARAMS
+        val params = Formats.GENERAL_PARAMS + filters
         val extra = mutableListOf<Param>()
         if (kind == Formats.VIDEO && fmt != null)
             extra += Formats.codecParams(selectedCodec(spVcodec, fmt.videoCodecs))
@@ -495,8 +524,7 @@ class MainActivity : AppCompatActivity() {
                 val clip = data.clipData
                 if (clip != null) for (i in 0 until clip.itemCount) uris += clip.getItemAt(i).uri
                 else data.data?.let { uris += it }
-                val paths = uris.mapNotNull { uriToPath(it) }
-                addFiles(paths)
+                resolveUrisAsync(uris)
             }
             REQ_OUT_DIR -> {
                 data.data?.let { uri ->
@@ -544,6 +572,27 @@ class MainActivity : AppCompatActivity() {
         }
     }
 
+    /** 后台解析 SAF Uri → 本地路径（无法取路径时需要拷贝，可能很慢，必须在后台线程）。 */
+    private fun resolveUrisAsync(uris: List<Uri>) {
+        if (uris.isEmpty()) return
+        val dlg = AlertDialog.Builder(this)
+            .setMessage("正在导入文件…")
+            .setCancelable(false)
+            .create()
+        dlg.show()
+        Thread {
+            val paths = uris.mapNotNull { uriToPath(it) }
+            runOnUiThread {
+                dlg.dismiss()
+                if (paths.isEmpty()) {
+                    Toast.makeText(this, "无法导入所选文件", Toast.LENGTH_SHORT).show()
+                } else {
+                    addFiles(paths)
+                }
+            }
+        }.start()
+    }
+
     private fun uriToPath(uri: Uri): String? {
         try {
             contentResolver.query(uri, arrayOf("_data"), null, null, null)?.use { c ->
@@ -553,9 +602,6 @@ class MainActivity : AppCompatActivity() {
                 }
             }
         } catch (e: Exception) { /* fallthrough 到拷贝 */ }
-        // 无法直接取路径：拷贝到缓存目录。
-        // 关键：必须保留原文件名（含扩展名），否则 addFiles 的
-        // 扩展名白名单过滤会把文件全部丢弃（“上传后无法识别”的根因）。
         return try {
             var name = ""
             contentResolver.query(uri, arrayOf("_display_name"), null, null, null)?.use { c ->
@@ -611,15 +657,16 @@ class MainActivity : AppCompatActivity() {
             applyKind(firstKind)
         }
         for (p in valid) if (p !in files) files += p
-        refreshFileList()
+        submitList()
         updateCount()
         Toast.makeText(this, "已添加 ${valid.size} 个文件", Toast.LENGTH_SHORT).show()
     }
 
     private fun removeSelected() {
+        val checked = adapter.getChecked()
         files.removeAll(checked)
-        checked.clear()
-        refreshFileList()
+        adapter.setChecked(emptySet())
+        submitList()
         updateCount()
     }
 
@@ -628,25 +675,35 @@ class MainActivity : AppCompatActivity() {
             "${getString(R.string.file_list)} · ${files.size} 个文件"
     }
 
-    /** 列表数据变化后：切换空状态提示，并把列表高度重测为内容高度
-     *  （列表嵌在整体 ScrollView 内，自身不滚动）。 */
-    private fun refreshFileList() {
-        adapter.notifyDataSetChanged()
-        lblEmpty.visibility = if (files.isEmpty()) View.VISIBLE else View.GONE
-        fileList.post {
-            var h = fileList.paddingTop + fileList.paddingBottom
-            val a = fileList.adapter ?: return@post
-            for (i in 0 until a.count) {
-                val itemView = a.getView(i, null, fileList)
-                itemView.measure(
-                    View.MeasureSpec.makeMeasureSpec(fileList.width, View.MeasureSpec.EXACTLY),
-                    View.MeasureSpec.makeMeasureSpec(0, View.MeasureSpec.UNSPECIFIED))
-                h += itemView.measuredHeight
-            }
-            h += fileList.dividerHeight * maxOf(0, a.count - 1)
-            val lp = fileList.layoutParams
-            if (lp.height != h) { lp.height = h; fileList.layoutParams = lp }
+    // ---------------- RecyclerView 数据同步 ----------------
+    private fun submitList() {
+        val items = files.map { path ->
+            FileItem(
+                path = path,
+                status = rowStatus[path] ?: "",
+                progress = rowProgress[path] ?: -1,
+                checked = path in adapter.getChecked()
+            )
         }
+        adapter.submitList(items)
+        lblEmpty.visibility = if (files.isEmpty()) View.VISIBLE else View.GONE
+    }
+
+    private fun updateItem(path: String) {
+        val items = adapter.currentList.map {
+            if (it.path == path)
+                it.copy(status = rowStatus[path] ?: "", progress = rowProgress[path] ?: -1)
+            else it
+        }
+        adapter.submitList(items)
+    }
+
+    private fun adapterCheckedAdd(path: String) {
+        // FileAdapter 内部已维护 checked 集合，这里无需额外操作
+    }
+
+    private fun adapterCheckedRemove(path: String) {
+        // 同上
     }
 
     private fun pickOutDir() {
@@ -662,7 +719,7 @@ class MainActivity : AppCompatActivity() {
             p["video_codec"] = selectedCodec(spVcodec, fmt.videoCodecs)
         if (fmt != null && fmt.audioCodecs.isNotEmpty() && kind != Formats.IMAGE)
             p["audio_codec"] = selectedCodec(spAcodec, fmt.audioCodecs)
-        p["overwrite"] = findViewById<CheckBox>(R.id.chk_overwrite).isChecked
+        p["overwrite"] = chkOverwrite.isChecked
         return p
     }
 
@@ -671,7 +728,8 @@ class MainActivity : AppCompatActivity() {
             PATTERNS[spPattern.selectedItemPosition].first
         else edPattern.text.toString().trim().ifEmpty { "{name}" }
 
-    private fun buildOutputPath(src: String, ext: String, index: Int): String {
+    private fun buildOutputPath(src: String, ext: String, index: Int,
+                                taken: MutableSet<String>? = null): String {
         val name = File(src).name.substringBeforeLast('.')
         val srcExt = File(src).name.substringAfterLast('.', "")
         val date = SimpleDateFormat("yyyyMMdd", Locale.getDefault()).format(Date())
@@ -685,13 +743,14 @@ class MainActivity : AppCompatActivity() {
             .replace(Regex("[/\\\\:*?\"<>|]"), "_")
         if (base.isBlank()) base = name
         val dir = outDir.ifEmpty { File(src).parent ?: "." }
+        val overwrite = chkOverwrite.isChecked
         var out = File(dir, "$base.$ext")
-        val overwrite = findViewById<CheckBox>(R.id.chk_overwrite).isChecked
         var i = 1
-        while (out.exists() && !overwrite) {
+        while ((!overwrite && out.exists()) || taken?.contains(out.absolutePath) == true) {
             out = File(dir, "${base}($i).$ext")
             i++
         }
+        taken?.add(out.absolutePath)
         return out.absolutePath
     }
 
@@ -702,12 +761,14 @@ class MainActivity : AppCompatActivity() {
         }
         val fmt = currentFormat() ?: return
         val params = collectParams()
+        val taken = mutableSetOf<String>()
         val jobs = files.mapIndexed { i, src ->
-            Job(src, buildOutputPath(src, fmt.ext, i + 1), params.toMap(), kind)
+            Job(src, buildOutputPath(src, fmt.ext, i + 1, taken), params.toMap(), kind)
         }
         rowStatus.clear()
+        rowProgress.clear()
         files.forEach { rowStatus[it] = "等待中" }
-        adapter.notifyDataSetChanged()
+        submitList()
         setBusy(true)
         progress.progress = 0
         lblStatus.text = "开始转换 ${jobs.size} 个文件…"
@@ -741,7 +802,7 @@ class MainActivity : AppCompatActivity() {
             textSize = 13f
             setPadding(0, dp(8), 0, dp(12))
         }
-        val list = ListView(this)
+        val list = android.widget.ListView(this)
         val listAdapter = ArrayAdapter<String>(this, android.R.layout.simple_list_item_1)
         list.adapter = listAdapter
         var selected: String? = null
@@ -856,7 +917,7 @@ class MainActivity : AppCompatActivity() {
     }
 
     private fun promptName(title: String, initial: String, onOk: (String) -> Unit) {
-        val ed = EditText(this).apply {
+        val ed = android.widget.EditText(this).apply {
             setText(initial)
             setSelection(initial.length)
             setHint("预设名称")
@@ -873,29 +934,6 @@ class MainActivity : AppCompatActivity() {
     }
 
     private fun dp(v: Int): Int = (v * resources.displayMetrics.density).toInt()
-
-    // ---------------- 列表适配器 ----------------
-    private inner class FileAdapter : BaseAdapter() {
-        override fun getCount() = files.size
-        override fun getItem(position: Int) = files[position]
-        override fun getItemId(position: Int) = position.toLong()
-
-        override fun getView(position: Int, convertView: View?, parent: ViewGroup?): View {
-            val view = convertView ?: layoutInflater.inflate(R.layout.item_file, parent, false)
-            val path = files[position]
-            val check = view.findViewById<CheckBox>(R.id.row_check)
-            val name = view.findViewById<TextView>(R.id.row_name)
-            val status = view.findViewById<TextView>(R.id.row_status)
-            name.text = File(path).name
-            status.text = rowStatus[path] ?: ""
-            check.setOnCheckedChangeListener(null)
-            check.isChecked = path in checked
-            check.setOnCheckedChangeListener { _, isChecked ->
-                if (isChecked) checked += path else checked -= path
-            }
-            return view
-        }
-    }
 
     companion object {
         private const val REQ_FILES = 1001

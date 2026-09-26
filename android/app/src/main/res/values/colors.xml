@@ -11,4 +11,5 @@
     <color name="app_card">#FFFFFF</color>
     <color name="app_fill">#E9E9EE</color>
     <color name="app_hairline">#14000000</color>
+    <color name="app_card_stroke">#1A000000</color>
 </resources>

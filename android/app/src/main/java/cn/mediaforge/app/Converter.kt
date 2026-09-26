@@ -56,6 +56,15 @@ object Converter {
         FFprobeKit.getMediaInformation(path).mediaInformation?.duration?.toDoubleOrNull()
     } catch (e: Exception) { null }
 
+    /** 探测首个音频流的采样率（Hz），失败返回 null。用于响度归一化/变调的
+     *  重采样基准，避免无信息时回退到固定 48kHz 造成失真。 */
+    fun probeAudioSampleRate(path: String): Int? {
+        return try {
+            val info = FFprobeKit.getMediaInformation(path).mediaInformation
+            info?.streams?.firstOrNull { it.type == "audio" }?.sampleRate?.toIntOrNull()
+        } catch (e: Exception) { null }
+    }
+
     fun start(jobs: List<Job>, workers: Int) {
         cancelled = false
         val ex = Executors.newFixedThreadPool(maxOf(1, workers))
@@ -113,16 +122,22 @@ object Converter {
             }
 
             val duration = probeDuration(src)
+            val sampleRate = probeAudioSampleRate(src)
+            // 注入采样率供音频滤镜使用（变调/响度归一化）
+            val params = if (sampleRate != null)
+                job.params + ("_sample_rate" to sampleRate) else job.params
+
             val passlog = if (Builder.needsTwoPass(job.params))
                 job.dst + ".passlog" else null
 
             val passes = if (passlog != null) listOf(1, 2) else listOf(0)
             for (passNo in passes) {
                 if (cancelled) {
+                    cleanupPasslog(passlog)
                     listener?.onJobDone(job, false, "已取消")
                     return
                 }
-                val args = Builder.buildCommand(src, job.dst, job.params, duration, passNo, passlog)
+                val args = Builder.buildCommand(src, job.dst, params, duration, passNo, passlog)
                 val latch = CountDownLatch(1)
                 var ok = false
                 var msg = ""
@@ -144,16 +159,33 @@ object Converter {
                         }
                     })
                     .let { sessions[job] = it }
-                latch.await()
+                // 兜底超时：即使 ffmpeg 挂死也不永久占用线程（24h 上限）
+                val finished = latch.await(24, java.util.concurrent.TimeUnit.HOURS)
+                if (!finished) {
+                    runCatching { sessions.remove(job)?.cancel() }
+                    cleanupPasslog(passlog)
+                    listener?.onJobDone(job, false, "任务超时")
+                    return
+                }
                 if (!ok) {
+                    cleanupPasslog(passlog)
                     listener?.onJobDone(job, false, msg.ifEmpty { "转换失败" })
                     return
                 }
             }
+            cleanupPasslog(passlog)
             listener?.onProgress(job, 1f, "")
             listener?.onJobDone(job, true, "")
         } finally {
             if (tmpVideo != null) runCatching { java.io.File(tmpVideo).delete() }
         }
+    }
+
+    /** 清理两遍编码产生的 passlog 临时文件。 */
+    private fun cleanupPasslog(passlog: String?) {
+        if (passlog == null) return
+        runCatching { java.io.File(passlog).delete() }
+        runCatching { java.io.File("$passlog-0.log").delete() }
+        runCatching { java.io.File("$passlog-0.log.mbtree").delete() }
     }
 }

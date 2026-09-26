@@ -25,6 +25,31 @@ object Builder {
         return v.toString().trim().lowercase() in setOf("1", "true", "yes", "on")
     }
 
+    /** 类 shlex 的参数拆分：支持单/双引号包裹含空格的参数。
+     *  与桌面端 shlex.split 行为对齐（如 -metadata title="hello world"）。 */
+    fun splitArgs(s: String): List<String> {
+        val out = mutableListOf<String>()
+        val cur = StringBuilder()
+        var inSingle = false
+        var inDouble = false
+        var i = 0
+        while (i < s.length) {
+            val c = s[i]
+            when {
+                c == '\\' && !inSingle && i + 1 < s.length -> { cur.append(s[i + 1]); i++ }
+                c == '\'' && !inDouble -> inSingle = !inSingle
+                c == '"' && !inSingle -> inDouble = !inDouble
+                c.isWhitespace() && !inSingle && !inDouble -> {
+                    if (cur.isNotEmpty()) { out += cur.toString(); cur.clear() }
+                }
+                else -> cur.append(c)
+            }
+            i++
+        }
+        if (cur.isNotEmpty()) out += cur.toString()
+        return out
+    }
+
     /** 转义 filtergraph 中的路径特殊字符（字幕路径可能含 : ' [ ] , ;）。 */
     fun escapeFilterPath(p: String): String =
         p.replace("\\", "/")
@@ -443,8 +468,9 @@ object Builder {
 
             val subMode = if (passNo == 1) "none" else s(params, "subtitle_mode", "copy")
             if (kind == Formats.VIDEO && subMode == "copy" && outExt in setOf("mkv", "mp4", "mov", "webm")) {
+                // 排除数据流与附件流，避免 MKV 内嵌字体附件导致 mov_text 失败
                 cmd += listOf("-c:s", if (outExt == "mkv") "copy" else "mov_text",
-                    "-map", "0", "-map", "-0:d?")
+                    "-map", "0", "-map", "-0:d?", "-map", "-0:t?")
             } else if (subMode in setOf("none", "burn")) {
                 cmd += "-sn"
             }
@@ -461,7 +487,7 @@ object Builder {
         else if (fmt?.muxer != null && kind != Formats.IMAGE) cmd += listOf("-f", fmt.muxer)
 
         val extra = s(params, "extra_args")
-        if (extra.isNotEmpty()) cmd += extra.split(Regex("\\s+")).filter { it.isNotEmpty() }
+        if (extra.isNotEmpty()) cmd += splitArgs(extra)
 
         if (passNo == 1) {
             if (passlog != null) cmd += listOf("-passlogfile", passlog)
@@ -473,6 +499,12 @@ object Builder {
         return cmd
     }
 
-    fun needsTwoPass(p: Map<String, Any?>): Boolean =
-        b(p, "two_pass") && s(p, "bitrate").isNotEmpty() && s(p, "video_codec") != "copy"
+    fun needsTwoPass(p: Map<String, Any?>): Boolean {
+        val vc = s(p, "video_codec")
+        val hw = setOf("h264_nvenc", "hevc_nvenc", "av1_nvenc",
+                       "h264_qsv", "hevc_qsv", "av1_qsv",
+                       "h264_amf", "hevc_amf", "av1_amf")
+        return b(p, "two_pass") && s(p, "bitrate").isNotEmpty()
+                && vc != "copy" && vc !in hw
+    }
 }

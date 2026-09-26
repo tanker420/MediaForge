@@ -123,37 +123,111 @@ object MotionPhoto {
             if (!run(cmd)) return false
 
             if (isCancelled()) return false
+            // 流式拼接：JPEG 很小可直接读；MP4 可能很大，边读边写避免 OOM
             val jpegData = jpg.readBytes()
-            val mp4Data = mp4.readBytes()
-            val xmp = makeXmpSegment(buildXmp(mp4Data.size, tsUs))
-            val out = injectXmp(jpegData, xmp) + mp4Data
-            File(dst).writeBytes(out)
+            val mp4Size = mp4.length().toInt()
+            val xmp = makeXmpSegment(buildXmp(mp4Size, tsUs))
+            File(dst).outputStream().buffered().use { out ->
+                // 手写 injectXmp 的流式版本：SOI + XMP APP1 + JPEG 剩余部分 + MP4
+                out.write(jpegData, 0, 2)
+                out.write(xmp)
+                out.write(jpegData, 2, jpegData.size - 2)
+                mp4.inputStream().buffered().use { it.copyTo(out) }
+            }
             return true
         } finally {
             jpg.delete(); mp4.delete(); tmp.delete()
         }
     }
 
-    /** 从 Motion Photo 里抽出内嵌 MP4 到临时文件，返回路径；失败返回 null。 */
+    /** 从 Motion Photo 里抽出内嵌 MP4 到临时文件，返回路径；失败返回 null。
+     *  流式实现：优先读文件头部 XMP 中的视频长度字段定位（MediaForge 生成的
+     *  文件含 OpCamera:VideoLength，标准 Google Motion Photo 含 Item:Length），
+     *  避免全文件读入内存；解析失败时回退头部 1MB 扫描 ftyp。 */
     fun extractMicrovideo(src: String): String? {
-        val data = File(src).readBytes()
-        val ftyp = byteArrayOf(
-            'f'.code.toByte(), 't'.code.toByte(), 'y'.code.toByte(), 'p'.code.toByte())
-        var pos = -1
-        for (i in data.size - 4 downTo 0) {
-            if (data[i] == ftyp[0] && data[i + 1] == ftyp[1] &&
-                data[i + 2] == ftyp[2] && data[i + 3] == ftyp[3]) { pos = i; break }
-        }
-        if (pos <= 0) {
-            for (i in 0..data.size - 4) {
-                if (data[i] == ftyp[0] && data[i + 1] == ftyp[1] &&
-                    data[i + 2] == ftyp[2] && data[i + 3] == ftyp[3]) { pos = i; break }
+        val f = File(src)
+        val total = f.length()
+        if (total <= 0) return null
+
+        // 读文件头（JPEG + XMP 在前 256KB 内通常足够）
+        val headSize = minOf(total, 256 * 1024L)
+        val head = ByteArray(headSize.toInt())
+        f.inputStream().use { it.readFully(head, headSize.toInt()) }
+
+        // 1) 优先用 XMP 里的视频长度：MP4 = 文件末尾 videoLen 字节
+        val headStr = String(head, Charsets.UTF_8)
+        val videoLen = Regex("""OpCamera:VideoLength="(\d+)"""").find(headStr)
+            ?.groupValues?.get(1)?.toLongOrNull()
+            ?: Regex("""Item:Semantic="MotionPhoto"[^>]*Item:Length="(\d+)"""").find(headStr)
+                ?.groupValues?.get(1)?.toLongOrNull()
+            ?: Regex("""Item:Length="(\d+)"[^>]*Item:Semantic="MotionPhoto"""").find(headStr)
+                ?.groupValues?.get(1)?.toLongOrNull()
+
+        var start = -1L
+        if (videoLen != null && videoLen in 1 until total) {
+            val candidate = total - videoLen
+            // 验证该位置确实是 ftyp 盒
+            val probe = ByteArray(8)
+            f.inputStream().use { ins ->
+                ins.skipFully(candidate)
+                ins.readFully(probe, 8)
+            }
+            if (probe[4] == 'f'.code.toByte() && probe[5] == 't'.code.toByte()
+                && probe[6] == 'y'.code.toByte() && probe[7] == 'p'.code.toByte()) {
+                start = candidate
             }
         }
-        if (pos <= 0) return null
-        val start = maxOf(0, pos - 4)
+
+        // 2) 回退：头部 1MB 内扫描 ftyp（MP4 紧跟在 JPEG 后面）
+        if (start < 0) {
+            val scanSize = minOf(total, 1024 * 1024L)
+            val buf = ByteArray(scanSize.toInt())
+            f.inputStream().use { it.readFully(buf, scanSize.toInt()) }
+            val ftyp = byteArrayOf('f'.code.toByte(), 't'.code.toByte(),
+                                   'y'.code.toByte(), 'p'.code.toByte())
+            val pos = lastIndexOf(buf, ftyp).let { if (it >= 0) it else indexOf(buf, ftyp) }
+            if (pos > 0) start = (pos - 4).toLong()
+        }
+        if (start < 0) return null
+
         val tmp = File.createTempFile("mf_mv_", ".mp4")
-        tmp.writeBytes(data.copyOfRange(start, data.size))
+        f.inputStream().buffered().use { ins ->
+            ins.skipFully(start)
+            tmp.outputStream().buffered().use { out -> ins.copyTo(out) }
+        }
         return tmp.absolutePath
+    }
+
+    private fun lastIndexOf(haystack: ByteArray, needle: ByteArray): Int {
+        outer@ for (i in haystack.size - needle.size downTo 0) {
+            for (j in needle.indices) if (haystack[i + j] != needle[j]) continue@outer
+            return i
+        }
+        return -1
+    }
+
+    private fun indexOf(haystack: ByteArray, needle: ByteArray): Int {
+        outer@ for (i in 0..haystack.size - needle.size) {
+            for (j in needle.indices) if (haystack[i + j] != needle[j]) continue@outer
+            return i
+        }
+        return -1
+    }
+
+    private fun java.io.InputStream.readFully(buf: ByteArray, n: Int) {
+        var off = 0
+        while (off < n) {
+            val r = read(buf, off, n - off)
+            if (r < 0) break
+            off += r
+        }
+    }
+
+    private fun java.io.InputStream.skipFully(n: Long) {
+        var left = n
+        while (left > 0) {
+            val r = skip(left)
+            if (r <= 0) { if (read() < 0) break } else left -= r
+        }
     }
 }
