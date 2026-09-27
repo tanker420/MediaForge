@@ -2,12 +2,14 @@
 #  MediaForge 构建发布（Windows 安装包 + Android APK）
 #  触发方式：
 #   1. 手动触发（Actions 页面点 Run workflow）
-#   2. 推送 v* 标签（如 v1.4.1）：自动构建 → 发布 Release →
-#      创建与标签同名的版本分支 → 清理旧的 release/* 与 backup/* 分支
+#   2. 推送 v* 标签（如 v1.4.2）：自动构建 → 发布 Release（说明取自标签附注）
+#      → 创建与标签同名的版本分支
 #
 #  终端兼容性：
 #   - Windows 安装包：windows-latest（PowerShell 7 调 packaging/ci/build.ps1）
+#     产物：MediaForge-<版本>-Setup.exe
 #   - Android APK：ubuntu-latest（bash + JDK 17 + Gradle 8.7 + Android SDK 34）
+#     产物：MediaForge-<版本>.apk
 #   - 发布：ubuntu-latest 汇总两个 Artifact 后统一挂到 Release
 #
 #  安卓签名：
@@ -118,11 +120,14 @@ jobs:
 
       # 签名配置已固化在仓库内，这一步确保产物确实是签名版而非 unsigned，
       # 避免「构建成功但发出去的 APK 装不上」这类静默失败。
+      # 产物名由 build.gradle.kts 按版本号生成（MediaForge-<版本>.apk），
+      # 这里通配匹配，避免改版本号时还要回来改 workflow。
       - name: 校验 APK 已签名
         working-directory: android
         run: |
-          APK="app/build/outputs/apk/release/app-release.apk"
-          test -f "$APK" || { echo "未找到 $APK"; exit 1; }
+          APK=$(ls app/build/outputs/apk/release/*.apk | head -1)
+          test -f "$APK" || { echo "未找到 release APK"; exit 1; }
+          echo "产物：$APK"
           APKSIGNER=$(find "$ANDROID_HOME/build-tools" -name apksigner -type f | sort | tail -1)
           "$APKSIGNER" verify --print-certs "$APK" | head -6
 
@@ -130,7 +135,7 @@ jobs:
         uses: actions/upload-artifact@v4
         with:
           name: MediaForge-APK
-          path: android/app/build/outputs/apk/release/app-release.apk
+          path: android/app/build/outputs/apk/release/*.apk
           if-no-files-found: error
 
   # ---------------- 发布 Release（推送标签时） ----------------
@@ -139,6 +144,25 @@ jobs:
     if: startsWith(github.ref, 'refs/tags/')
     runs-on: ubuntu-latest
     steps:
+      # 需要标签对象本身才能读到附注标签的说明文字，因此 fetch-depth: 0
+      - name: 检出代码
+        uses: actions/checkout@v5
+        with:
+          fetch-depth: 0
+
+      - name: 提取标签说明作为发布说明
+        env:
+          TAG: ${{ github.ref_name }}
+        run: |
+          git fetch --force origin "refs/tags/$TAG:refs/tags/$TAG" 2>/dev/null || true
+          git tag -l --format='%(contents)' "$TAG" > release_body.md
+          if [ ! -s release_body.md ]; then
+            echo "Release $TAG" > release_body.md
+            echo "标签未附说明，请补充后重新发版。" >> release_body.md
+          fi
+          echo "--- 发布说明 ---"
+          cat release_body.md
+
       - name: 收集 Windows 安装包
         uses: actions/download-artifact@v4
         with:
@@ -151,16 +175,17 @@ jobs:
           name: MediaForge-APK
           path: release_assets
 
+      # body（标签说明）会前置，generate_release_notes 追加的 Full Changelog 跟在后面
       - name: 发布 Release
         uses: softprops/action-gh-release@v2
         with:
           files: release_assets/*
+          body_path: release_body.md
           generate_release_notes: true
 
-  # ---------------- 版本分支维护（发版之后） ----------------
-  #  推送 v* 标签发版成功后：
-  #   1. 创建与标签同名的版本分支（如 v1.4.1），指向该标签的提交；
-  #   2. 删除所有 release/* 与 backup/* 分支——版本分支是唯一保留的备份形态。
+  # ---------------- 版本分支（发版之后） ----------------
+  #  推送 v* 标签发版成功后，创建与标签同名的版本分支（如 v1.4.2），
+  #  指向该标签的提交——这是唯一的版本备份形态。
   tag-branch:
     needs: [release]
     if: startsWith(github.ref, 'refs/tags/')
@@ -171,23 +196,10 @@ jobs:
         with:
           fetch-depth: 0
 
-      - name: 创建版本分支并清理旧分支
+      - name: 创建版本分支
         env:
           TAG: ${{ github.ref_name }}
         run: |
           # 以标签为基准创建同名版本分支；重复发版同一标签时强制对齐
           git push origin "+refs/tags/$TAG:refs/heads/$TAG"
           echo "已创建版本分支：$TAG"
-
-          # 清理 release/* 与 backup/* 分支
-          refs=$(git ls-remote --heads origin 'refs/heads/release/*' 'refs/heads/backup/*' \
-                 | awk '{print $2}')
-          if [ -z "$refs" ]; then
-            echo "没有需要清理的 release/* 或 backup/* 分支"
-          else
-            echo "$refs" | while read -r ref; do
-              branch="${ref#refs/heads/}"
-              echo "删除分支：$branch"
-              git push origin --delete "$branch"
-            done
-          fi
