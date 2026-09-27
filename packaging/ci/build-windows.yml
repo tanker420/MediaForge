@@ -3,12 +3,35 @@
 #  真正被 GitHub Actions 使用的是仓库根目录的
 #  .github/workflows/build-windows.yml，本文件为模板副本，
 #  供复用到其它仓库时参考。逻辑一致：
-#   1. build-windows   → windows-latest 构建 Windows 安装包
-#   2. build-android   → ubuntu-latest 构建 Android APK
-#   3. release         → 推送 v* 标签时汇总两者发布 Release
-#  安卓签名：优先 Secret ANDROID_KEYSTORE_BASE64（base64 的
-#  android/release.keystore，alias/password 为 mediaforge）；
-#  未配置时 CI 现场生成一次性密钥（可安装，但与本地签名不连续）。
+#   1. build-windows → windows-latest 构建 Windows 安装包
+#   2. build-android → ubuntu-latest 构建 Android APK
+#   3. release       → 推送 v* 标签时汇总两者发布 Release
+#   4. tag-branch    → 发版后创建与标签同名的版本分支
+#  安卓签名：密钥与口令随仓库固化，CI 不需要任何 Secret。
+#
+#  ---- 以下为真实工作流内容 ----
+#
+#  MediaForge 构建发布（Windows 安装包 + Android APK）
+#  触发方式：
+#   1. 手动触发（Actions 页面点 Run workflow）
+#   2. 推送 v* 标签（如 v1.4.2）：自动构建 → 发布 Release（说明取自标签附注）
+#      → 创建与标签同名的版本分支
+#
+#  终端兼容性：
+#   - Windows 安装包：windows-latest（PowerShell 7 调 packaging/ci/build.ps1）
+#     产物：MediaForge-<版本>-Setup.exe
+#   - Android APK：ubuntu-latest（bash + JDK 17 + Gradle 8.7 + Android SDK 34）
+#     产物：MediaForge-<版本>.apk
+#   - 发布：ubuntu-latest 汇总两个 Artifact 后统一挂到 Release
+#
+#  安卓签名：
+#   - 签名密钥 android/release.keystore 已入库，口令（alias/password 均为
+#     mediaforge）写死在 android/app/build.gradle.kts 中，CI 不需要任何 Secret。
+#   - 因此本地与 CI 产出的 APK 签名完全一致，用户可直接覆盖升级。
+#
+#  Windows 签名：
+#   - 可选。配置 Secret `CODE_SIGNING_PFX_BASE64`（base64 编码的 .pfx）与
+#     `CODE_SIGNING_PFX_PASSWORD` 即启用 signtool 签名；未配置则跳过。
 # ============================================================
 name: 构建 Windows 安装包与 Android APK
 
@@ -26,11 +49,12 @@ permissions:
   contents: write
 
 jobs:
+  # ---------------- Windows 安装包 ----------------
   build-windows:
     runs-on: windows-latest
     steps:
       - name: 检出代码
-        uses: actions/checkout@v4
+        uses: actions/checkout@v5
 
       - name: 设置 Python
         uses: actions/setup-python@v5
@@ -41,9 +65,11 @@ jobs:
       - name: 执行构建脚本
         shell: pwsh
         env:
+          # 代码签名证书（base64 编码的 .pfx）—— 可选；缺证书时跳过签名。
           CODE_SIGNING_PFX_BASE64: ${{ secrets.CODE_SIGNING_PFX_BASE64 }}
           CODE_SIGNING_PFX_PASSWORD: ${{ secrets.CODE_SIGNING_PFX_PASSWORD }}
         run: |
+          # PowerShell 7（windows-latest 预装）：默认 UTF-8，规避 5.1 的编码坑。
           $ver = "${{ inputs.version }}"
           if ([string]::IsNullOrWhiteSpace($ver)) {
             $tag = git tag --list 'v*' --sort=-v:refname 2>$null | Select-Object -First 1
@@ -68,42 +94,32 @@ jobs:
           path: dist_installer/*.exe
           if-no-files-found: error
 
+  # ---------------- Android APK ----------------
   build-android:
     runs-on: ubuntu-latest
     steps:
       - name: 检出代码
-        uses: actions/checkout@v4
+        uses: actions/checkout@v5
 
       - name: 设置 JDK 17
-        uses: actions/setup-java@v4
+        uses: actions/setup-java@v5
         with:
           distribution: temurin
           java-version: "17"
 
+      # v3 停在 Node20，从 2026-09 起在 runner 上必然失败；
+      # v4 已迁移到 Node24，并修复了 cmdline-tools 22.0 的下载地址。
       - name: 设置 Android SDK
-        uses: android-actions/setup-android@v3
+        uses: android-actions/setup-android@v4
+        with:
+          cmdline-tools-version: "15859902"   # 显式固定，避免上游 latest 漂移
+          packages: "platform-tools"
 
-      - name: 安装 Android 34 平台与构建工具（缺失时）
+      - name: 安装 Android 34 平台与构建工具
         run: |
           yes | sdkmanager --licenses > /dev/null 2>&1 || true
-          sdkmanager "platforms;android-34" "build-tools;34.0.0" > /dev/null 2>&1 || true
+          sdkmanager "platforms;android-34" "build-tools;34.0.0"
           echo "ANDROID_HOME=$ANDROID_HOME"
-
-      - name: 准备签名密钥
-        env:
-          KEYSTORE_B64: ${{ secrets.ANDROID_KEYSTORE_BASE64 }}
-        run: |
-          if [ -n "$KEYSTORE_B64" ]; then
-            echo "$KEYSTORE_B64" | base64 -d > android/release.keystore
-            echo "使用 Secret ANDROID_KEYSTORE_BASE64 签名（与本地密钥一致）"
-          else
-            keytool -genkeypair -v -keystore android/release.keystore \
-              -alias mediaforge -keyalg RSA -keysize 2048 -validity 10000 \
-              -storepass mediaforge -keypass mediaforge \
-              -dname "CN=MediaForge, OU=MediaForge, O=MediaForge, L=CN, ST=CN, C=CN" \
-              > /dev/null 2>&1
-            echo "未配置签名 Secret，已生成 CI 一次性密钥（与本地签名不一致，覆盖升级需先卸载旧版）"
-          fi
 
       - name: 设置 Gradle 8.7
         uses: gradle/actions/setup-gradle@v3
@@ -114,18 +130,51 @@ jobs:
         working-directory: android
         run: gradle :app:assembleRelease --no-daemon
 
+      # 签名配置已固化在仓库内，这一步确保产物确实是签名版而非 unsigned，
+      # 避免「构建成功但发出去的 APK 装不上」这类静默失败。
+      # 产物名由 build.gradle.kts 按版本号生成（MediaForge-<版本>.apk），
+      # 这里通配匹配，避免改版本号时还要回来改 workflow。
+      - name: 校验 APK 已签名
+        working-directory: android
+        run: |
+          APK=$(ls app/build/outputs/apk/release/*.apk | head -1)
+          test -f "$APK" || { echo "未找到 release APK"; exit 1; }
+          echo "产物：$APK"
+          APKSIGNER=$(find "$ANDROID_HOME/build-tools" -name apksigner -type f | sort | tail -1)
+          "$APKSIGNER" verify --print-certs "$APK" | head -6
+
       - name: 上传 APK（Artifact）
         uses: actions/upload-artifact@v4
         with:
           name: MediaForge-APK
-          path: android/app/build/outputs/apk/release/app-release.apk
+          path: android/app/build/outputs/apk/release/*.apk
           if-no-files-found: error
 
+  # ---------------- 发布 Release（推送标签时） ----------------
   release:
     needs: [build-windows, build-android]
     if: startsWith(github.ref, 'refs/tags/')
     runs-on: ubuntu-latest
     steps:
+      # 需要标签对象本身才能读到附注标签的说明文字，因此 fetch-depth: 0
+      - name: 检出代码
+        uses: actions/checkout@v5
+        with:
+          fetch-depth: 0
+
+      - name: 提取标签说明作为发布说明
+        env:
+          TAG: ${{ github.ref_name }}
+        run: |
+          git fetch --force origin "refs/tags/$TAG:refs/tags/$TAG" 2>/dev/null || true
+          git tag -l --format='%(contents)' "$TAG" > release_body.md
+          if [ ! -s release_body.md ]; then
+            echo "Release $TAG" > release_body.md
+            echo "标签未附说明，请补充后重新发版。" >> release_body.md
+          fi
+          echo "--- 发布说明 ---"
+          cat release_body.md
+
       - name: 收集 Windows 安装包
         uses: actions/download-artifact@v4
         with:
@@ -138,8 +187,31 @@ jobs:
           name: MediaForge-APK
           path: release_assets
 
+      # body（标签说明）会前置，generate_release_notes 追加的 Full Changelog 跟在后面
       - name: 发布 Release
         uses: softprops/action-gh-release@v2
         with:
           files: release_assets/*
+          body_path: release_body.md
           generate_release_notes: true
+
+  # ---------------- 版本分支（发版之后） ----------------
+  #  推送 v* 标签发版成功后，创建与标签同名的版本分支（如 v1.4.2），
+  #  指向该标签的提交——这是唯一的版本备份形态。
+  tag-branch:
+    needs: [release]
+    if: startsWith(github.ref, 'refs/tags/')
+    runs-on: ubuntu-latest
+    steps:
+      - name: 检出代码
+        uses: actions/checkout@v5
+        with:
+          fetch-depth: 0
+
+      - name: 创建版本分支
+        env:
+          TAG: ${{ github.ref_name }}
+        run: |
+          # 以标签为基准创建同名版本分支；重复发版同一标签时强制对齐
+          git push origin "+refs/tags/$TAG:refs/heads/$TAG"
+          echo "已创建版本分支：$TAG"
