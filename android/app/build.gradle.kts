@@ -1,5 +1,3 @@
-import java.util.Properties
-
 plugins {
     id("com.android.application")
     id("org.jetbrains.kotlin.android")
@@ -20,33 +18,19 @@ android {
 
     signingConfigs {
         create("release") {
-            val ks = rootProject.file("release.keystore")
-            // 口令从 local.properties 读（该文件已被 .gitignore 排除，不入库）。
-            // 未配置时 release 构建退化为不签名，CI 会注入签名配置。
-            val lp = Properties().apply {
-                val f = rootProject.file("local.properties")
-                if (f.exists()) f.inputStream().use { load(it) }
-            }
-            val storePwd = lp.getProperty("keystore.storePassword", "")
-            val keyPwd = lp.getProperty("keystore.keyPassword", "")
-            val alias = lp.getProperty("keystore.keyAlias", "")
-            if (ks.exists() && storePwd.isNotEmpty() && alias.isNotEmpty()) {
-                storeFile = ks
-                storePassword = storePwd
-                keyAlias = alias
-                keyPassword = keyPwd
-            }
+            // 签名密钥与口令随仓库固化（release.keystore 已入库），
+            // 保证本地与 CI 产出的 APK 签名完全一致，可直接覆盖升级。
+            storeFile = rootProject.file("release.keystore")
+            storePassword = "mediaforge"
+            keyAlias = "mediaforge"
+            keyPassword = "mediaforge"
         }
     }
 
     buildTypes {
         release {
             isMinifyEnabled = false
-            val ks = rootProject.file("release.keystore")
-            if (ks.exists() &&
-                signingConfigs.getByName("release").storePassword?.isNotEmpty() == true) {
-                signingConfig = signingConfigs.getByName("release")
-            }
+            signingConfig = signingConfigs.getByName("release")
         }
     }
 
