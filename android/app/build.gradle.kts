@@ -1,7 +1,14 @@
+import com.android.build.gradle.api.BaseVariantOutput
+import com.android.build.gradle.internal.api.ApkVariantOutputImpl
+import org.gradle.api.Action
+
 plugins {
     id("com.android.application")
     id("org.jetbrains.kotlin.android")
 }
+
+// 版本号单一来源：versionName 与产物文件名都从这里取
+val appVersion = "1.4.2"
 
 android {
     namespace = "cn.mediaforge.app"
@@ -11,8 +18,8 @@ android {
         applicationId = "cn.mediaforge.app"
         minSdk = 24
         targetSdk = 34
-        versionCode = 141
-        versionName = "1.4.1"
+        versionCode = 142
+        versionName = appVersion
         ndk { abiFilters += listOf("armeabi-v7a", "arm64-v8a") }
     }
 
@@ -31,6 +38,19 @@ android {
         release {
             isMinifyEnabled = false
             signingConfig = signingConfigs.getByName("release")
+        }
+    }
+
+    // 产物按版本号命名：MediaForge-1.4.2.apk（原先固定为 app-release.apk）。
+    // 必须显式 Action，否则 Kotlin 会把 outputs.all{} 解析成 Iterable.all 谓词重载。
+    applicationVariants.all {
+        if (buildType.name == "release") {
+            outputs.all(object : Action<BaseVariantOutput> {
+                override fun execute(output: BaseVariantOutput) {
+                    (output as ApkVariantOutputImpl).outputFileName =
+                        "MediaForge-$appVersion.apk"
+                }
+            })
         }
     }
 
